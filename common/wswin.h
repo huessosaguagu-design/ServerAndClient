@@ -25,6 +25,9 @@ static constexpr SocketT INVALID = nullptr;
 bool init();
 void shutdown();
 
+// Last error string (human-readable)
+std::string lastError();
+
 // Connect to wss://host:port/path (or ws:// if port != 443)
 SocketT connect(const std::string& host, int port, const std::string& path = "/ws");
 

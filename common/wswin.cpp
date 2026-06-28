@@ -7,6 +7,8 @@
 #pragma comment(lib, "winhttp.lib")
 
 #include <cstring>
+#include <cstdio>
+#include <cstdarg>
 #include <cstdlib>
 
 // ═══════════════════════════════════════════════════════════════════
@@ -50,8 +52,35 @@ struct WsSession {
 
 namespace ws {
 
+// ── Error storage ─────────────────────────────────────────────────
+static std::string g_lastError;
+
+std::string lastError() { return g_lastError; }
+
+static void setError(const char* fmt, ...) {
+    char buf[256];
+    va_list args; va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    g_lastError = buf;
+}
+
+static const char* winHttpErrorStr(DWORD err) {
+    switch (err) {
+        case 12002: return "Timeout";
+        case 12007: return "DNS not resolved";
+        case 12029: return "Connection refused";
+        case 12031: return "Connection reset";
+        case 12057: return "Secure channel error";
+        case 12157: return "SSL error";
+        case 12169: return "Invalid certificate";
+        case 12175: return "Cert validation failed";
+        default: return "Unknown";
+    }
+}
+
 // ── init / shutdown ───────────────────────────────────────────────
-bool init() { return true; }
+bool init() { g_lastError.clear(); return true; }
 void shutdown() {}
 
 // ── connect ───────────────────────────────────────────────────────
@@ -105,9 +134,7 @@ SocketT connect(const std::string& host, int port, const std::string& path) {
         if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
             DWORD err = GetLastError();
-            char dbg[128]; snprintf(dbg, sizeof(dbg),
-                "WS send fail: attempt=%d err=%lu", attempt, err);
-            OutputDebugStringA(dbg);
+            setError("Send failed: %s (err=%lu)", winHttpErrorStr(err), err);
             WinHttpCloseHandle(hRequest);
             delete s;
             if (attempt < 2) { Sleep(3000); }
@@ -117,9 +144,7 @@ SocketT connect(const std::string& host, int port, const std::string& path) {
         // 6. Receive response (should be 101 Switching Protocols)
         if (!WinHttpReceiveResponse(hRequest, nullptr)) {
             DWORD err = GetLastError();
-            char dbg[128]; snprintf(dbg, sizeof(dbg),
-                "WS recv fail: attempt=%d err=%lu", attempt, err);
-            OutputDebugStringA(dbg);
+            setError("Receive failed: %s (err=%lu)", winHttpErrorStr(err), err);
             WinHttpCloseHandle(hRequest);
             delete s;
             if (attempt < 2) { Sleep(3000); }
@@ -132,9 +157,12 @@ SocketT connect(const std::string& host, int port, const std::string& path) {
         WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
         if (statusCode != 101) {
-            char dbg[128]; snprintf(dbg, sizeof(dbg),
-                "WS status=%lu (need 101)", statusCode);
-            OutputDebugStringA(dbg);
+            setError("Server returned HTTP %lu (expected 101). "
+                     "Check: 1) relay is Python+WebSocket  2) path is /ws", statusCode);
+            WinHttpCloseHandle(hRequest);
+            delete s;
+            if (attempt < 2) { Sleep(3000); }
+            continue;
         }
 
         // 7. Complete WebSocket upgrade
@@ -143,14 +171,13 @@ SocketT connect(const std::string& host, int port, const std::string& path) {
 
         if (!s->hSocket) {
             DWORD err = GetLastError();
-            char dbg[128]; snprintf(dbg, sizeof(dbg),
-                "WS upgrade fail: err=%lu", err);
-            OutputDebugStringA(dbg);
+            setError("WebSocket upgrade failed: %s (err=%lu)", winHttpErrorStr(err), err);
             delete s;
             if (attempt < 2) { Sleep(3000); }
             continue;
         }
 
+        setError("OK");
         return s;  // Success!
     }
 

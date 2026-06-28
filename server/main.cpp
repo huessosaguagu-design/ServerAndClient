@@ -402,7 +402,7 @@ static void doConnect() {
     if (g_sock != ws::INVALID) { g_receiver.stop(); ws::close(g_sock); g_sock = ws::INVALID; }
     g_connected = false;
     g_sock = ws::connect(std::string(g_hostBuf), g_port);
-    if (g_sock == ws::INVALID) { addLog("[!] Connect failed: %s:%d", g_hostBuf, g_port); return; }
+    if (g_sock == ws::INVALID) { addLog("[!] Connect failed: %s", ws::lastError().c_str()); return; }
     proto::Writer w; w.u8(proto::ROLE_SERVER);
     auto m = proto::buildMessage(proto::MSG_REGISTER, 0, w.bytes());
     if (!ws::sendAll(g_sock, m.data(), m.size())) {

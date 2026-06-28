@@ -557,7 +557,7 @@ static void doConnect() {
 
     g_sock = ws::connect(std::string(g_hostBuf), g_port);
     if (g_sock == ws::INVALID) {
-        addLog("[!] Failed to connect to %s:%d", g_hostBuf, g_port);
+        addLog("[!] Connect failed: %s", ws::lastError().c_str());
         return;
     }
 
