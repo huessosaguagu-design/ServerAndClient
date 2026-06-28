@@ -76,6 +76,19 @@ static bool httpPost(HINTERNET hSession, const std::wstring& host, int port, boo
     }
 
     if (!WinHttpReceiveResponse(hRequest, nullptr)) {
+        DWORD err = GetLastError();
+        setError("POST recv fail: err=%lu", err);
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); return false;
+    }
+
+    // Check HTTP status code
+    DWORD statusCode = 0;
+    DWORD statusCodeSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
+
+    if (statusCode != 200) {
+        setError("POST %s: HTTP %lu", path, statusCode);
         WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); return false;
     }
 
@@ -85,6 +98,11 @@ static bool httpPost(HINTERNET hSession, const std::wstring& host, int port, boo
     response.clear();
     while (WinHttpReadData(hRequest, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
         response.append(buf, bytesRead);
+
+    // Trim whitespace/newlines from response
+    while (!response.empty() && (response.back() == '\r' || response.back() == '\n' ||
+           response.back() == ' ' || response.back() == '\t'))
+        response.pop_back();
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);

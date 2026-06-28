@@ -30,7 +30,7 @@
 struct ClientEntry { uint32_t id; std::string name; };
 struct FileEntry   { bool isDir; uint64_t size; std::string name; };
 
-static char g_hostBuf[256] = "serverandclient-2.onrender.com";
+static char g_hostBuf[256] = "relay-server-production-eff8.up.railway.app";
 static int  g_port = 443;
 static ws::SocketT g_sock = ws::INVALID;
 static std::atomic<bool> g_connected{false};
