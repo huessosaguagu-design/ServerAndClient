@@ -562,44 +562,22 @@ static void doConnect() {
     addLog("[*] Connecting to %s:%d ...", g_hostBuf, g_port);
 
     std::thread([]() {
-        g_sock = ws::connect(std::string(g_hostBuf), g_port, "/ws");
+        std::string regPayload;
+        regPayload.push_back((char)proto::ROLE_CLIENT);
+        uint32_t nameLen = (uint32_t)strlen(g_nameBuf);
+        regPayload.append((char*)&nameLen, 4);
+        regPayload.append(g_nameBuf, nameLen);
+
+        g_sock = ws::connect(std::string(g_hostBuf), g_port, regPayload);
         if (g_sock == ws::INVALID) {
             addLog("[!] Connect failed: %s", ws::lastError().c_str());
             g_connecting = false;
             return;
         }
-
-        // Send REGISTER(client, name)
-        proto::Writer w;
-        w.u8(proto::ROLE_CLIENT);
-        w.str(std::string(g_nameBuf));
-        auto msg = proto::buildMessage(proto::MSG_REGISTER, 0, w.bytes());
-        if (!ws::sendAll(g_sock, msg.data(), msg.size())) {
-            ws::close(g_sock); g_sock = ws::INVALID;
-            addLog("[!] Failed to send register");
-            g_connecting = false;
-            return;
-        }
-
-        // Receive assigned ID (blocking, before receiver thread)
-        uint8_t msgType, cmdType;
-        std::vector<uint8_t> payload;
-        if (!ws::recvMessage(g_sock, msgType, cmdType, payload) ||
-            msgType != proto::MSG_REGISTER)
-        {
-            ws::close(g_sock); g_sock = ws::INVALID;
-            addLog("[!] Failed to receive register response");
-            g_connecting = false;
-            return;
-        }
-
-        proto::Reader r(payload.data(), payload.size());
-        r.u32(g_clientId);
-
         g_connected = true;
         g_connecting = false;
         g_receiver.start(g_sock, onMessage);
-        addLog("[+] Connected to relay %s:%d (ID: %u)", g_hostBuf, g_port, g_clientId);
+        addLog("[+] Connected to relay %s:%d", g_hostBuf, g_port);
     }).detach();
 }
 

@@ -7,29 +7,24 @@
 #include <atomic>
 #include <thread>
 
-// ═══════════════════════════════════════════════════════════════════
-//  WSWIN — WebSocket client using WinHTTP (WSS for Railway)
-// ═══════════════════════════════════════════════════════════════════
-
-struct WsSession;
+struct HttpPollSession;
 
 namespace ws {
 
-using SocketT = WsSession*;
+using SocketT = HttpPollSession*;
 static constexpr SocketT INVALID = nullptr;
 
 bool init();
 void shutdown();
 std::string lastError();
 
-// Connect to wss://host:port/path
-SocketT connect(const std::string& host, int port, const std::string& path = "/ws");
+// Connect: POST /register with payload, returns session
+SocketT connect(const std::string& host, int port, const std::string& regPayload);
 
 bool sendAll(SocketT sock, const void* data, size_t len);
-bool recvAll(SocketT sock, void* data, size_t len);
 bool sendMessage(SocketT sock, const std::vector<uint8_t>& msg);
-bool recvMessage(SocketT sock, uint8_t& msgType, uint8_t& cmdType,
-                 std::vector<uint8_t>& payload);
+bool recvAll(SocketT, void*, size_t) { return false; }
+bool recvMessage(SocketT, uint8_t&, uint8_t&, std::vector<uint8_t>&) { return false; }
 
 void close(SocketT sock);
 
