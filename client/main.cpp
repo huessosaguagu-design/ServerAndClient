@@ -30,7 +30,7 @@
 
 // ── Change this to your OnRender relay URL ──────────────────────────
 #ifndef DEFAULT_RELAY_HOST
-  #define DEFAULT_RELAY_HOST "serverandclient-1.onrender.com"
+  #define DEFAULT_RELAY_HOST "serverandclient-2.onrender.com"
 #endif
 #ifndef DEFAULT_RELAY_PORT
   #define DEFAULT_RELAY_PORT 443

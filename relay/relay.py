@@ -198,8 +198,9 @@ def main():
     print(f"    /ws      — WebSocket (client/server)")
     print(f"    /health  — HTTP health check")
     print(f"========================================")
+    sys.stdout.flush()
 
-    web.run_app(app, port=port, print=None)
+    web.run_app(app, host='0.0.0.0', port=port, print=None)
 
 if __name__ == '__main__':
     main()

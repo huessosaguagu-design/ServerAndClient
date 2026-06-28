@@ -5,4 +5,4 @@ RUN pip install --no-cache-dir aiohttp
 COPY relay/relay.py .
 COPY requirements.txt .
 EXPOSE 10000
-CMD ["python", "relay.py"]
+CMD ["python", "-u", "relay.py"]
