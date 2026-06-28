@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-WebSocket Relay Server for Server-Client Remote Control.
-Uses aiohttp for WebSocket + HTTP health check on same port.
-Deploy on OnRender — reads PORT from environment.
+HTTP Long-Poll Relay Server — works through any HTTP proxy (OnRender).
+No WebSocket needed. Uses simple POST/GET for message passing.
+
+POST /register   — register as client/server, returns session ID
+POST /send?id=X  — send binary message to relay
+GET  /poll?id=X  — long-poll for pending messages (30s timeout)
+GET  /            — status
+GET  /health      — health check
 """
-import asyncio
-import struct
 import os
 import sys
-import traceback
-from aiohttp import web, WSMsgType
+import time
+import uuid
+import asyncio
+from aiohttp import web
 
 # ── Protocol constants ─────────────────────────────────────────────
 MSG_REGISTER    = 1
@@ -19,175 +24,159 @@ MSG_RESPONSE    = 4
 ROLE_CLIENT     = 1
 ROLE_SERVER     = 2
 
-# ── Shared state ───────────────────────────────────────────────────
-clients = {}          # id -> websocket
-client_names = {}     # id -> name
-servers = []          # list of websockets
-next_id = 1
+# ── Session ────────────────────────────────────────────────────────
+class Session:
+    def __init__(self, sid, role, name, ws=None):
+        self.id = sid
+        self.role = role        # 1=client, 2=server
+        self.name = name
+        self.messages = asyncio.Queue()  # pending messages for this session
+        self.alive = True
 
-def build_msg(msg_type, cmd_type, payload=b''):
-    return struct.pack('<IBB', len(payload), msg_type, cmd_type) + payload
-
-def recv_message(data: bytes):
-    if len(data) < 6:
-        return None
-    payload_size, msg_type, cmd_type = struct.unpack('<IBB', data[:6])
-    if len(data) < 6 + payload_size:
-        return None
-    payload = data[6:6 + payload_size]
-    return msg_type, cmd_type, payload, 6 + payload_size
+sessions = {}  # sid -> Session
+client_sessions = {}  # sid -> Session (only clients)
+server_sessions = {}   # sid -> Session (only servers)
 
 def build_client_list():
-    payload = struct.pack('<I', len(clients))
-    for cid, ws in list(clients.items()):
-        name = client_names.get(cid, 'unknown').encode('utf-8')
-        payload += struct.pack('<I', cid)
+    """Build binary client list message."""
+    import struct
+    payload = struct.pack('<I', len(client_sessions))
+    for sid, s in client_sessions.items():
+        name = s.name.encode('utf-8')
+        payload += struct.pack('<I', s.id)
         payload += struct.pack('<I', len(name)) + name
     return payload
 
+def build_msg(msg_type, cmd_type, payload=b''):
+    import struct
+    return struct.pack('<IBB', len(payload), msg_type, cmd_type) + payload
+
 async def broadcast_client_list():
+    if not client_sessions:
+        return
     payload = build_client_list()
     msg = build_msg(MSG_CLIENT_LIST, 0, payload)
-    for ws in list(servers):
-        try:
-            await ws.send_bytes(msg)
-        except Exception:
-            pass
+    for sid, s in server_sessions.items():
+        if s.alive:
+            await s.messages.put(msg)
 
-async def send_to_all_servers(msg: bytes):
-    for ws in list(servers):
-        try:
-            await ws.send_bytes(msg)
-        except Exception:
-            pass
+async def handle_register(request):
+    """POST /register — body: [role:1byte] [name_len:4bytes] [name]"""
+    body = await request.read()
+    if len(body) < 1:
+        return web.Response(text='Bad body', status=400)
 
-async def handle_websocket(ws):
-    global next_id
+    role = body[0]
+    name = "unknown"
+    if len(body) >= 5:
+        import struct
+        name_len = struct.unpack('<I', body[1:5])[0]
+        name = body[5:5+name_len].decode('utf-8', errors='replace')
 
-    try:
-        msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
-    except asyncio.TimeoutError:
-        print("[!] WS: Register timeout")
-        return
-
-    if msg.type != WSMsgType.BINARY:
-        print(f"[!] WS: Expected binary, got {msg.type}")
-        return
-
-    data = msg.data
-    result = recv_message(data)
-    if result is None:
-        print("[!] WS: Bad message format")
-        return
-
-    msg_type, cmd_type, payload, consumed = result
-    if msg_type != MSG_REGISTER or not payload:
-        print(f"[!] WS: Not REGISTER (type={msg_type})")
-        return
-
-    role = payload[0]
+    sid = str(uuid.uuid4())[:8]
+    s = Session(sid, role, name)
+    sessions[sid] = s
 
     if role == ROLE_CLIENT:
-        name = "client"
-        if len(payload) > 4:
-            name_len = struct.unpack('<I', payload[1:5])[0]
-            name = payload[5:5 + name_len].decode('utf-8', errors='replace')
-
-        cid = next_id
-        next_id += 1
-        clients[cid] = ws
-        client_names[cid] = name
-
-        ack = build_msg(MSG_REGISTER, 0, struct.pack('<I', cid))
-        await ws.send_bytes(ack)
-
+        client_sessions[sid] = s
+        # Send back the assigned session ID as binary
+        # Format: MSG_REGISTER payload = 4 bytes session_id_hash
+        import struct
+        sid_hash = struct.pack('<I', hash(sid) & 0xFFFFFFFF)
+        await s.messages.put(build_msg(MSG_REGISTER, 0, sid_hash))
         await broadcast_client_list()
-        print(f"[+] Client '{name}' registered as id={cid}", flush=True)
-
-        try:
-            async for msg in ws:
-                if msg.type != WSMsgType.BINARY:
-                    continue
-                result = recv_message(msg.data)
-                if result is None:
-                    continue
-                mt, ct, pl, _ = result
-                if mt == MSG_RESPONSE:
-                    fwd = build_msg(MSG_RESPONSE, ct, struct.pack('<I', cid) + pl)
-                    await send_to_all_servers(fwd)
-        except Exception as e:
-            print(f"[!] Client {cid} error: {e}")
-
-        if cid in clients:
-            del clients[cid]
-        if cid in client_names:
-            del client_names[cid]
-        await broadcast_client_list()
-        print(f"[-] Client id={cid} disconnected", flush=True)
-
+        print(f"[+] Client '{name}' sid={sid}", flush=True)
     elif role == ROLE_SERVER:
-        servers.append(ws)
+        server_sessions[sid] = s
+        # Send current client list
+        payload = build_client_list()
+        await s.messages.put(build_msg(MSG_CLIENT_LIST, 0, payload))
+        print(f"[+] Server sid={sid}", flush=True)
+    else:
+        del sessions[sid]
+        return web.Response(text='Bad role', status=400)
 
-        pl = build_client_list()
-        msg = build_msg(MSG_CLIENT_LIST, 0, pl)
-        await ws.send_bytes(msg)
-        print("[+] Server connected", flush=True)
+    return web.Response(text=sid)
 
-        try:
-            async for msg in ws:
-                if msg.type != WSMsgType.BINARY:
-                    continue
-                result = recv_message(msg.data)
-                if result is None:
-                    continue
-                mt, ct, pl, _ = result
-                if mt == MSG_COMMAND and len(pl) >= 4:
-                    target_id = struct.unpack('<I', pl[:4])[0]
-                    fwd = build_msg(MSG_COMMAND, ct, pl[4:])
-                    target_ws = clients.get(target_id)
-                    if target_ws:
-                        try:
-                            await target_ws.send_bytes(fwd)
-                        except Exception:
-                            pass
-        except Exception as e:
-            print(f"[!] Server error: {e}")
+async def handle_send(request):
+    """POST /send?id=XXX — body = binary message"""
+    sid = request.query.get('id', '')
+    s = sessions.get(sid)
+    if not s or not s.alive:
+        return web.Response(text='Bad session', status=403)
 
-        if ws in servers:
-            servers.remove(ws)
-        print("[-] Server disconnected", flush=True)
+    body = await request.read()
+    if not body:
+        return web.Response(text='Empty', status=400)
 
-async def websocket_handler(request):
-    # Check if this is actually a WebSocket upgrade request
-    if not request.headers.get('Upgrade', '').lower() == 'websocket':
-        # Regular HTTP request to /ws — return info page
-        return web.Response(text='WebSocket endpoint. Use a WebSocket client to connect.', status=200)
+    import struct
+    if len(body) < 6:
+        return web.Response(text='Too short', status=400)
 
-    print(f"[WS] Connection from {request.remote}", flush=True)
-    ws = web.WebSocketResponse(max_msg_size=0)
+    payload_size, msg_type, cmd_type = struct.unpack('<IBB', body[:6])
+    payload = body[6:6+payload_size]
+
+    if s.role == ROLE_SERVER:
+        # Server → Client: MSG_COMMAND with target_id prefix
+        if msg_type == MSG_COMMAND and len(payload) >= 4:
+            target_hash = struct.unpack('<I', payload[:4])[0]
+            # Find client by hash
+            for cid, cs in client_sessions.items():
+                if (hash(cid) & 0xFFFFFFFF) == target_hash:
+                    fwd = build_msg(MSG_COMMAND, cmd_type, payload[4:])
+                    await cs.messages.put(fwd)
+                    break
+    elif s.role == ROLE_CLIENT:
+        # Client → Server: MSG_RESPONSE with source_id prefix
+        if msg_type == MSG_RESPONSE:
+            src_hash = struct.unpack('<I', struct.pack('<I', hash(s.id) & 0xFFFFFFFF))[0]
+            fwd = build_msg(MSG_RESPONSE, cmd_type, struct.pack('<I', src_hash) + payload)
+            for ssid, ss in server_sessions.items():
+                if ss.alive:
+                    await ss.messages.put(fwd)
+
+    return web.Response(text='OK')
+
+async def handle_poll(request):
+    """GET /poll?id=XXX — long-poll for messages (30s timeout)"""
+    sid = request.query.get('id', '')
+    s = sessions.get(sid)
+    if not s or not s.alive:
+        return web.Response(text='Bad session', status=403)
+
     try:
-        await ws.prepare(request)
-    except Exception as e:
-        print(f"[!] WS prepare failed: {e}", flush=True)
-        return ws
+        # Wait up to 25 seconds for a message
+        msg = await asyncio.wait_for(s.messages.get(), timeout=25.0)
+        return web.Response(body=msg, content_type='application/octet-stream')
+    except asyncio.TimeoutError:
+        return web.Response(status=204)  # No content = no messages
 
-    print("[WS] Upgrade OK", flush=True)
-    await handle_websocket(ws)
-    return ws
-
-async def health_check(request):
-    n_clients = len(clients)
-    n_servers = len(servers)
-    return web.Response(text=f'OK\nClients: {n_clients}\nServers: {n_servers}')
+async def handle_disconnect(request):
+    """POST /disconnect?id=XXX"""
+    sid = request.query.get('id', '')
+    s = sessions.get(sid)
+    if s:
+        s.alive = False
+        if sid in client_sessions:
+            del client_sessions[sid]
+            await broadcast_client_list()
+            print(f"[-] Client sid={sid} disconnected", flush=True)
+        if sid in server_sessions:
+            del server_sessions[sid]
+            print(f"[-] Server sid={sid} disconnected", flush=True)
+        del sessions[sid]
+    return web.Response(text='OK')
 
 async def root_handler(request):
-    return web.Response(text='Relay Server Running\n\nEndpoints:\n  /ws - WebSocket\n  /health - Status')
+    n_c = len(client_sessions)
+    n_s = len(server_sessions)
+    return web.Response(text=f'Relay Server Running\nClients: {n_c}\nServers: {n_s}')
+
+async def health_check(request):
+    return web.Response(text='OK')
 
 async def on_startup(app):
-    print("[*] Server starting...", flush=True)
-
-async def on_cleanup(app):
-    print("[*] Server shutting down...", flush=True)
+    print("[*] HTTP Relay Server starting...", flush=True)
 
 def main():
     port = int(os.environ.get('PORT', '10000'))
@@ -196,23 +185,22 @@ def main():
 
     app = web.Application()
     app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
     app.router.add_get('/', root_handler)
     app.router.add_get('/health', health_check)
-    app.router.add_get('/ws', websocket_handler)
+    app.router.add_post('/register', handle_register)
+    app.router.add_post('/send', handle_send)
+    app.router.add_get('/poll', handle_poll)
+    app.router.add_post('/disconnect', handle_disconnect)
 
     print("========================================", flush=True)
-    print(f"  WebSocket Relay Server on port {port}", flush=True)
-    print(f"  Endpoints:", flush=True)
-    print(f"    /ws      - WebSocket", flush=True)
-    print(f"    /health  - HTTP health check", flush=True)
+    print(f"  HTTP Relay Server on port {port}", flush=True)
+    print(f"  POST /register   - register", flush=True)
+    print(f"  POST /send?id=X  - send message", flush=True)
+    print(f"  GET  /poll?id=X  - long-poll messages", flush=True)
+    print(f"  GET  /health     - status", flush=True)
     print("========================================", flush=True)
 
-    try:
-        web.run_app(app, host='0.0.0.0', port=port, print=None)
-    except Exception as e:
-        print(f"[!] FATAL: {e}", flush=True)
-        traceback.print_exc()
+    web.run_app(app, host='0.0.0.0', port=port, print=None)
 
 if __name__ == '__main__':
     main()

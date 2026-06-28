@@ -8,46 +8,40 @@
 #include <thread>
 
 // ═══════════════════════════════════════════════════════════════════
-//  WSWIN — WebSocket client using WinHTTP (WSS for OnRender)
+//  HTTPPOLL — HTTP long-poll transport (works through any proxy)
 //
-//  Same interface as net::, but uses WebSocket protocol.
-//  Port 443 → WSS (TLS), other ports → WS (plain, for local testing).
+//  Instead of WebSocket, uses simple HTTP:
+//    POST /register → get session ID
+//    POST /send?id=X → send binary message
+//    GET /poll?id=X → long-poll for incoming messages
 // ═══════════════════════════════════════════════════════════════════
 
-struct WsSession;
+struct HttpPollSession;
 
 namespace ws {
 
-using SocketT = WsSession*;
+using SocketT = HttpPollSession*;
 static constexpr SocketT INVALID = nullptr;
 
-// Init / shutdown WinHTTP
 bool init();
 void shutdown();
-
-// Last error string (human-readable)
 std::string lastError();
 
-// Connect to wss://host:port/path (or ws:// if port != 443)
-SocketT connect(const std::string& host, int port, const std::string& path = "/ws");
+// Connect: POST /register with payload, returns session
+SocketT connect(const std::string& host, int port, const std::string& path = "/register");
 
-// Send exactly n bytes as one WebSocket binary message
+// Send a binary message via POST /send
 bool sendAll(SocketT sock, const void* data, size_t len);
 
-// Receive exactly n bytes (buffered internally)
+// Not used in HTTP mode — kept for compatibility
 bool recvAll(SocketT sock, void* data, size_t len);
-
-// Send one framed message (header + payload)
 bool sendMessage(SocketT sock, const std::vector<uint8_t>& msg);
-
-// Receive one framed message (blocking)
 bool recvMessage(SocketT sock, uint8_t& msgType, uint8_t& cmdType,
                  std::vector<uint8_t>& payload);
 
-// Close WebSocket session
 void close(SocketT sock);
 
-// Background receiver thread
+// Background poller thread
 class Receiver {
 public:
     using OnMessage = std::function<void(uint8_t msgType, uint8_t cmdType,
