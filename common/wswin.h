@@ -8,32 +8,24 @@
 #include <thread>
 
 // ═══════════════════════════════════════════════════════════════════
-//  HTTPPOLL — HTTP long-poll transport (works through any proxy)
-//
-//  Instead of WebSocket, uses simple HTTP:
-//    POST /register → get session ID
-//    POST /send?id=X → send binary message
-//    GET /poll?id=X → long-poll for incoming messages
+//  WSWIN — WebSocket client using WinHTTP (WSS for Railway)
 // ═══════════════════════════════════════════════════════════════════
 
-struct HttpPollSession;
+struct WsSession;
 
 namespace ws {
 
-using SocketT = HttpPollSession*;
+using SocketT = WsSession*;
 static constexpr SocketT INVALID = nullptr;
 
 bool init();
 void shutdown();
 std::string lastError();
 
-// Connect: POST /register with payload, returns session
-SocketT connect(const std::string& host, int port, const std::string& path = "/register");
+// Connect to wss://host:port/path
+SocketT connect(const std::string& host, int port, const std::string& path = "/ws");
 
-// Send a binary message via POST /send
 bool sendAll(SocketT sock, const void* data, size_t len);
-
-// Not used in HTTP mode — kept for compatibility
 bool recvAll(SocketT sock, void* data, size_t len);
 bool sendMessage(SocketT sock, const std::vector<uint8_t>& msg);
 bool recvMessage(SocketT sock, uint8_t& msgType, uint8_t& cmdType,
@@ -41,7 +33,6 @@ bool recvMessage(SocketT sock, uint8_t& msgType, uint8_t& cmdType,
 
 void close(SocketT sock);
 
-// Background poller thread
 class Receiver {
 public:
     using OnMessage = std::function<void(uint8_t msgType, uint8_t cmdType,
