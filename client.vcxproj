@@ -44,7 +44,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;gdiplus.lib;ws2_32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;gdiplus.lib;ws2_32.lib;advapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>libcmt.lib;msvcrt.lib</IgnoreSpecificDefaultLibraries>
     </Link>
   </ItemDefinitionGroup>
@@ -66,6 +66,7 @@
   <ItemGroup>
     <ClCompile Include="client\main.cpp" />
     <ClCompile Include="common\imgui_setup.cpp" />
+    <ClCompile Include="common\wswin.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="imgui.vcxproj">

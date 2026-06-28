@@ -7,7 +7,7 @@
 #include <ws2tcpip.h>
 
 #include "imgui_setup.h"
-#include "network.h"
+#include "wswin.h"
 #include "protocol.h"
 #include "protection.h"
 
@@ -30,20 +30,20 @@
 
 // ── Change this to your OnRender relay URL ──────────────────────────
 #ifndef DEFAULT_RELAY_HOST
-  #define DEFAULT_RELAY_HOST "127.0.0.1"
+  #define DEFAULT_RELAY_HOST "serverandclient-mkzb.onrender.com"
 #endif
 #ifndef DEFAULT_RELAY_PORT
-  #define DEFAULT_RELAY_PORT 10000
+  #define DEFAULT_RELAY_PORT 443
 #endif
 
 // ── State ───────────────────────────────────────────────────────────
 static char g_hostBuf[256] = DEFAULT_RELAY_HOST;
 static int  g_port         = DEFAULT_RELAY_PORT;
 static char g_nameBuf[128] = "Client";
-static net::SocketT g_sock = net::INVALID;
+static ws::SocketT g_sock = ws::INVALID;
 static std::atomic<bool> g_connected{false};
 static uint32_t g_clientId = 0;
-static net::Receiver g_receiver;
+static ws::Receiver g_receiver;
 
 // Auto-connect
 static bool  g_autoConnect   = true;
@@ -543,20 +543,20 @@ static void onMessage(uint8_t msgType, uint8_t cmdType, std::vector<uint8_t> pay
     }
 
     auto msg = proto::buildMessage(proto::MSG_RESPONSE, cmdType, resp);
-    net::sendAll(g_sock, msg.data(), msg.size());
+    ws::sendAll(g_sock, msg.data(), msg.size());
 }
 
 // ── Connect / Disconnect ───────────────────────────────────────────
 static void doConnect() {
-    if (g_sock != net::INVALID) {
+    if (g_sock != ws::INVALID) {
         g_receiver.stop();
-        net::close(g_sock);
-        g_sock = net::INVALID;
+        ws::close(g_sock);
+        g_sock = ws::INVALID;
     }
     g_connected = false;
 
-    g_sock = net::connect(std::string(g_hostBuf), g_port);
-    if (g_sock == net::INVALID) {
+    g_sock = ws::connect(std::string(g_hostBuf), g_port);
+    if (g_sock == ws::INVALID) {
         addLog("[!] Failed to connect to %s:%d", g_hostBuf, g_port);
         return;
     }
@@ -566,8 +566,8 @@ static void doConnect() {
     w.u8(proto::ROLE_CLIENT);
     w.str(std::string(g_nameBuf));
     auto msg = proto::buildMessage(proto::MSG_REGISTER, 0, w.bytes());
-    if (!net::sendAll(g_sock, msg.data(), msg.size())) {
-        net::close(g_sock); g_sock = net::INVALID;
+    if (!ws::sendAll(g_sock, msg.data(), msg.size())) {
+        ws::close(g_sock); g_sock = ws::INVALID;
         addLog("[!] Failed to send register");
         return;
     }
@@ -575,10 +575,10 @@ static void doConnect() {
     // Receive assigned ID (blocking, before receiver thread)
     uint8_t msgType, cmdType;
     std::vector<uint8_t> payload;
-    if (!net::recvMessage(g_sock, msgType, cmdType, payload) ||
+    if (!ws::recvMessage(g_sock, msgType, cmdType, payload) ||
         msgType != proto::MSG_REGISTER)
     {
-        net::close(g_sock); g_sock = net::INVALID;
+        ws::close(g_sock); g_sock = ws::INVALID;
         addLog("[!] Failed to receive register response");
         return;
     }
@@ -593,8 +593,8 @@ static void doConnect() {
 
 static void doDisconnect() {
     g_receiver.stop();
-    net::close(g_sock);
-    g_sock = net::INVALID;
+    ws::close(g_sock);
+    g_sock = ws::INVALID;
     g_connected = false;
     g_clientId = 0;
     addLog("[*] Disconnected");
@@ -697,12 +697,12 @@ int main() {
     InitializeProtection();
     Gdiplus::GdiplusStartupInput gdiInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiInput, nullptr);
-    net::init();
+    ws::init();
 
     int ret = imguiRun(L"Client - Remote Access", 600, 500, nullptr, onDraw);
 
     if (g_connected) doDisconnect();
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
-    net::shutdown();
+    ws::shutdown();
     return ret;
 }

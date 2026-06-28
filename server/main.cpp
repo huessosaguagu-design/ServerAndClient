@@ -6,7 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "imgui_setup.h"
-#include "network.h"
+#include "wswin.h"
 #include "protocol.h"
 #include "protection.h"
 #include <windows.h>
@@ -30,11 +30,11 @@
 struct ClientEntry { uint32_t id; std::string name; };
 struct FileEntry   { bool isDir; uint64_t size; std::string name; };
 
-static char g_hostBuf[256] = "127.0.0.1";
-static int  g_port = 10000;
-static net::SocketT g_sock = net::INVALID;
+static char g_hostBuf[256] = "serverandclient-mkzb.onrender.com";
+static int  g_port = 443;
+static ws::SocketT g_sock = ws::INVALID;
 static std::atomic<bool> g_connected{false};
-static net::Receiver g_receiver;
+static ws::Receiver g_receiver;
 
 static std::mutex g_clientMutex;
 static std::vector<ClientEntry> g_clients;
@@ -299,7 +299,7 @@ static void sendCommand(uint8_t ct, const std::vector<uint8_t>& pl) {
     proto::Writer w; w.u32(g_selectedClient);
     w.raw(pl.data(), pl.size());
     auto m = proto::buildMessage(proto::MSG_COMMAND, ct, w.bytes());
-    net::sendAll(g_sock, m.data(), m.size());
+    ws::sendAll(g_sock, m.data(), m.size());
 }
 static bool canSend() {
     if (!g_connected) { addLog("[!] Not connected"); return false; }
@@ -399,21 +399,21 @@ static void onMessage(uint8_t mt, uint8_t ct, std::vector<uint8_t> pl) {
     }
 }
 static void doConnect() {
-    if (g_sock != net::INVALID) { g_receiver.stop(); net::close(g_sock); g_sock = net::INVALID; }
+    if (g_sock != ws::INVALID) { g_receiver.stop(); ws::close(g_sock); g_sock = ws::INVALID; }
     g_connected = false;
-    g_sock = net::connect(std::string(g_hostBuf), g_port);
-    if (g_sock == net::INVALID) { addLog("[!] Connect failed: %s:%d", g_hostBuf, g_port); return; }
+    g_sock = ws::connect(std::string(g_hostBuf), g_port);
+    if (g_sock == ws::INVALID) { addLog("[!] Connect failed: %s:%d", g_hostBuf, g_port); return; }
     proto::Writer w; w.u8(proto::ROLE_SERVER);
     auto m = proto::buildMessage(proto::MSG_REGISTER, 0, w.bytes());
-    if (!net::sendAll(g_sock, m.data(), m.size())) {
-        net::close(g_sock); g_sock = net::INVALID; addLog("[!] Register failed"); return;
+    if (!ws::sendAll(g_sock, m.data(), m.size())) {
+        ws::close(g_sock); g_sock = ws::INVALID; addLog("[!] Register failed"); return;
     }
     g_connected = true;
     g_receiver.start(g_sock, onMessage);
     addLog("[+] Connected: %s:%d", g_hostBuf, g_port);
 }
 static void doDisconnect() {
-    g_receiver.stop(); net::close(g_sock); g_sock = net::INVALID; g_connected = false;
+    g_receiver.stop(); ws::close(g_sock); g_sock = ws::INVALID; g_connected = false;
     std::lock_guard<std::mutex> lk(g_clientMutex);
     g_clients.clear(); g_selectedClient = 0;
     addLog("[*] Disconnected");
@@ -1162,11 +1162,11 @@ int main() {
     InitializeProtection();
     Gdiplus::GdiplusStartupInput gi;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gi, nullptr);
-    net::init();
+    ws::init();
     int r = imguiRun(L"Server - Remote Control", 1100, 750, []() { applyStyle(); }, onDraw);
     if (g_connected) doDisconnect();
     if (g_screenTexture) imguiReleaseTexture(g_screenTexture);
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
-    net::shutdown();
+    ws::shutdown();
     return r;
 }
