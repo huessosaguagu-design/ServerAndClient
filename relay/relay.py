@@ -150,16 +150,12 @@ async def handle_websocket(ws):
         print("[-] Server disconnected", flush=True)
 
 async def websocket_handler(request):
-    if not request.headers.get('Upgrade', '').lower() == 'websocket':
-        return web.Response(text='WebSocket endpoint. Use ws:// or wss://', status=200)
-
     print(f"[WS] Connection from {request.remote}", flush=True)
     ws = web.WebSocketResponse(max_msg_size=0)
-    try:
-        await ws.prepare(request)
-    except Exception as e:
-        print(f"[!] WS prepare failed: {e}", flush=True)
-        return ws
+    ok = await ws.prepare(request)
+    if not ok:
+        print("[!] WS prepare returned False", flush=True)
+        return web.Response(text='WebSocket upgrade failed', status=400)
 
     print("[WS] Upgrade OK", flush=True)
     await handle_websocket(ws)
