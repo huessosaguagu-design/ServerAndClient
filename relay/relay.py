@@ -25,23 +25,25 @@ ROLE_CLIENT     = 1
 ROLE_SERVER     = 2
 
 # ── Session ────────────────────────────────────────────────────────
+next_id = 1
+
 class Session:
-    def __init__(self, sid, role, name, ws=None):
-        self.id = sid
-        self.role = role        # 1=client, 2=server
+    def __init__(self, sid, role, name):
+        self.id = sid          # integer ID
+        self.sid_str = ""      # string session token (for HTTP)
+        self.role = role       # 1=client, 2=server
         self.name = name
-        self.messages = asyncio.Queue()  # pending messages for this session
+        self.messages = asyncio.Queue()
         self.alive = True
 
-sessions = {}  # sid -> Session
-client_sessions = {}  # sid -> Session (only clients)
-server_sessions = {}   # sid -> Session (only servers)
+sessions = {}          # sid_str -> Session
+client_sessions = {}  # sid_str -> Session (only clients)
+server_sessions = {}   # sid_str -> Session (only servers)
 
 def build_client_list():
-    """Build binary client list message."""
     import struct
     payload = struct.pack('<I', len(client_sessions))
-    for sid, s in client_sessions.items():
+    for sid_str, s in client_sessions.items():
         name = s.name.encode('utf-8')
         payload += struct.pack('<I', s.id)
         payload += struct.pack('<I', len(name)) + name
@@ -56,12 +58,11 @@ async def broadcast_client_list():
         return
     payload = build_client_list()
     msg = build_msg(MSG_CLIENT_LIST, 0, payload)
-    for sid, s in server_sessions.items():
+    for sid_str, s in server_sessions.items():
         if s.alive:
             await s.messages.put(msg)
 
 async def handle_register(request):
-    """POST /register — body: [role:1byte] [name_len:4bytes] [name]"""
     body = await request.read()
     if len(body) < 1:
         return web.Response(text='Bad body', status=400)
@@ -73,30 +74,31 @@ async def handle_register(request):
         name_len = struct.unpack('<I', body[1:5])[0]
         name = body[5:5+name_len].decode('utf-8', errors='replace')
 
-    sid = str(uuid.uuid4())[:8]
-    s = Session(sid, role, name)
-    sessions[sid] = s
+    global next_id
+    sid_int = next_id
+    next_id += 1
+    sid_str = str(sid_int)
+    s = Session(sid_int, role, name)
+    s.sid_str = sid_str
+    sessions[sid_str] = s
 
     if role == ROLE_CLIENT:
-        client_sessions[sid] = s
-        # Send back the assigned session ID as binary
-        # Format: MSG_REGISTER payload = 4 bytes session_id_hash
+        client_sessions[sid_str] = s
         import struct
-        sid_hash = struct.pack('<I', hash(sid) & 0xFFFFFFFF)
+        sid_hash = struct.pack('<I', sid_int)
         await s.messages.put(build_msg(MSG_REGISTER, 0, sid_hash))
         await broadcast_client_list()
-        print(f"[+] Client '{name}' sid={sid}", flush=True)
+        print(f"[+] Client '{name}' id={sid_int}", flush=True)
     elif role == ROLE_SERVER:
-        server_sessions[sid] = s
-        # Send current client list
+        server_sessions[sid_str] = s
         payload = build_client_list()
         await s.messages.put(build_msg(MSG_CLIENT_LIST, 0, payload))
-        print(f"[+] Server sid={sid}", flush=True)
+        print(f"[+] Server id={sid_int}", flush=True)
     else:
-        del sessions[sid]
+        del sessions[sid_str]
         return web.Response(text='Bad role', status=400)
 
-    return web.Response(text=sid)
+    return web.Response(text=sid_str)
 
 async def handle_send(request):
     """POST /send?id=XXX — body = binary message"""
@@ -119,19 +121,18 @@ async def handle_send(request):
     if s.role == ROLE_SERVER:
         # Server → Client: MSG_COMMAND with target_id prefix
         if msg_type == MSG_COMMAND and len(payload) >= 4:
-            target_hash = struct.unpack('<I', payload[:4])[0]
-            # Find client by hash
-            for cid, cs in client_sessions.items():
-                if (hash(cid) & 0xFFFFFFFF) == target_hash:
+            target_id = struct.unpack('<I', payload[:4])[0]
+            # Find client by integer ID
+            for sid_str, cs in client_sessions.items():
+                if cs.id == target_id:
                     fwd = build_msg(MSG_COMMAND, cmd_type, payload[4:])
                     await cs.messages.put(fwd)
                     break
     elif s.role == ROLE_CLIENT:
         # Client → Server: MSG_RESPONSE with source_id prefix
         if msg_type == MSG_RESPONSE:
-            src_hash = struct.unpack('<I', struct.pack('<I', hash(s.id) & 0xFFFFFFFF))[0]
-            fwd = build_msg(MSG_RESPONSE, cmd_type, struct.pack('<I', src_hash) + payload)
-            for ssid, ss in server_sessions.items():
+            fwd = build_msg(MSG_RESPONSE, cmd_type, struct.pack('<I', s.id) + payload)
+            for sid_str, ss in server_sessions.items():
                 if ss.alive:
                     await ss.messages.put(fwd)
 
