@@ -398,19 +398,36 @@ static void onMessage(uint8_t mt, uint8_t ct, std::vector<uint8_t> pl) {
         addLog("[<] Kill: %s", r.c_str());
     }
 }
+static std::atomic<bool> g_connecting{false};
+
 static void doConnect() {
+    if (g_connecting) return;
+    g_connecting = true;
+
     if (g_sock != ws::INVALID) { g_receiver.stop(); ws::close(g_sock); g_sock = ws::INVALID; }
     g_connected = false;
-    g_sock = ws::connect(std::string(g_hostBuf), g_port);
-    if (g_sock == ws::INVALID) { addLog("[!] Connect failed: %s", ws::lastError().c_str()); return; }
-    proto::Writer w; w.u8(proto::ROLE_SERVER);
-    auto m = proto::buildMessage(proto::MSG_REGISTER, 0, w.bytes());
-    if (!ws::sendAll(g_sock, m.data(), m.size())) {
-        ws::close(g_sock); g_sock = ws::INVALID; addLog("[!] Register failed"); return;
-    }
-    g_connected = true;
-    g_receiver.start(g_sock, onMessage);
-    addLog("[+] Connected: %s:%d", g_hostBuf, g_port);
+    addLog("[*] Connecting to %s:%d ...", g_hostBuf, g_port);
+
+    std::thread([]() {
+        g_sock = ws::connect(std::string(g_hostBuf), g_port);
+        if (g_sock == ws::INVALID) {
+            addLog("[!] Connect failed: %s", ws::lastError().c_str());
+            g_connecting = false;
+            return;
+        }
+        proto::Writer w; w.u8(proto::ROLE_SERVER);
+        auto m = proto::buildMessage(proto::MSG_REGISTER, 0, w.bytes());
+        if (!ws::sendAll(g_sock, m.data(), m.size())) {
+            ws::close(g_sock); g_sock = ws::INVALID;
+            addLog("[!] Register failed");
+            g_connecting = false;
+            return;
+        }
+        g_connected = true;
+        g_connecting = false;
+        g_receiver.start(g_sock, onMessage);
+        addLog("[+] Connected: %s:%d", g_hostBuf, g_port);
+    }).detach();
 }
 static void doDisconnect() {
     g_receiver.stop(); ws::close(g_sock); g_sock = ws::INVALID; g_connected = false;
@@ -535,7 +552,18 @@ static void drawSidebar(float w) {
             ImGui::ColorConvertFloat4ToU32(DS::Card), 10);
         ImGui::SetCursorScreenPos(ImVec2(cp.x + 22, cp.y + 14));
 
-        if (!g_connected) {
+        if (g_connecting) {
+            // Connecting state
+            dl->AddCircleFilled(ImVec2(cp.x + 26, cp.y + 22), 5,
+                ImGui::ColorConvertFloat4ToU32(DS::Yellow));
+            ImGui::SetCursorPosX(40);
+            ImGui::TextColored(DS::Yellow, "Connecting...");
+            ImGui::SetCursorPosX(22);
+            ImGui::TextColored(DS::T3, "%s:%d", g_hostBuf, g_port);
+            ImGui::Dummy(ImVec2(0, 4));
+            ImGui::SetCursorPosX(22);
+            if (ghostBtn("Cancel", ImVec2(w - 44, 28))) g_connecting = false;
+        } else if (!g_connected) {
             ImGui::TextColored(DS::T3, "RELAY");
             ImGui::Dummy(ImVec2(0, 6));
             ImGui::SetCursorPosX(22); ImGui::PushItemWidth(w - 44);

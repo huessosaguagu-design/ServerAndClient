@@ -547,48 +547,60 @@ static void onMessage(uint8_t msgType, uint8_t cmdType, std::vector<uint8_t> pay
 }
 
 // ── Connect / Disconnect ───────────────────────────────────────────
+static std::atomic<bool> g_connecting{false};
+
 static void doConnect() {
+    if (g_connecting) return;
+    g_connecting = true;
+
     if (g_sock != ws::INVALID) {
         g_receiver.stop();
         ws::close(g_sock);
         g_sock = ws::INVALID;
     }
     g_connected = false;
+    addLog("[*] Connecting to %s:%d ...", g_hostBuf, g_port);
 
-    g_sock = ws::connect(std::string(g_hostBuf), g_port);
-    if (g_sock == ws::INVALID) {
-        addLog("[!] Connect failed: %s", ws::lastError().c_str());
-        return;
-    }
+    std::thread([]() {
+        g_sock = ws::connect(std::string(g_hostBuf), g_port);
+        if (g_sock == ws::INVALID) {
+            addLog("[!] Connect failed: %s", ws::lastError().c_str());
+            g_connecting = false;
+            return;
+        }
 
-    // Send REGISTER(client, name)
-    proto::Writer w;
-    w.u8(proto::ROLE_CLIENT);
-    w.str(std::string(g_nameBuf));
-    auto msg = proto::buildMessage(proto::MSG_REGISTER, 0, w.bytes());
-    if (!ws::sendAll(g_sock, msg.data(), msg.size())) {
-        ws::close(g_sock); g_sock = ws::INVALID;
-        addLog("[!] Failed to send register");
-        return;
-    }
+        // Send REGISTER(client, name)
+        proto::Writer w;
+        w.u8(proto::ROLE_CLIENT);
+        w.str(std::string(g_nameBuf));
+        auto msg = proto::buildMessage(proto::MSG_REGISTER, 0, w.bytes());
+        if (!ws::sendAll(g_sock, msg.data(), msg.size())) {
+            ws::close(g_sock); g_sock = ws::INVALID;
+            addLog("[!] Failed to send register");
+            g_connecting = false;
+            return;
+        }
 
-    // Receive assigned ID (blocking, before receiver thread)
-    uint8_t msgType, cmdType;
-    std::vector<uint8_t> payload;
-    if (!ws::recvMessage(g_sock, msgType, cmdType, payload) ||
-        msgType != proto::MSG_REGISTER)
-    {
-        ws::close(g_sock); g_sock = ws::INVALID;
-        addLog("[!] Failed to receive register response");
-        return;
-    }
+        // Receive assigned ID (blocking, before receiver thread)
+        uint8_t msgType, cmdType;
+        std::vector<uint8_t> payload;
+        if (!ws::recvMessage(g_sock, msgType, cmdType, payload) ||
+            msgType != proto::MSG_REGISTER)
+        {
+            ws::close(g_sock); g_sock = ws::INVALID;
+            addLog("[!] Failed to receive register response");
+            g_connecting = false;
+            return;
+        }
 
-    proto::Reader r(payload.data(), payload.size());
-    r.u32(g_clientId);
+        proto::Reader r(payload.data(), payload.size());
+        r.u32(g_clientId);
 
-    g_connected = true;
-    g_receiver.start(g_sock, onMessage);
-    addLog("[+] Connected to relay %s:%d (ID: %u)", g_hostBuf, g_port, g_clientId);
+        g_connected = true;
+        g_connecting = false;
+        g_receiver.start(g_sock, onMessage);
+        addLog("[+] Connected to relay %s:%d (ID: %u)", g_hostBuf, g_port, g_clientId);
+    }).detach();
 }
 
 static void doDisconnect() {
@@ -619,7 +631,7 @@ static void onDraw() {
         g_firstFrame = false;
         g_connectDelay = 2.0f;
     }
-    if (g_autoConnect && !g_connected) {
+    if (g_autoConnect && !g_connected && !g_connecting) {
         g_connectDelay -= io.DeltaTime;
         if (g_connectDelay <= 0.0f) {
             doConnect();
@@ -635,7 +647,10 @@ static void onDraw() {
         ImGuiWindowFlags_NoBringToFrontOnFocus);
 
     // Connection settings
-    if (!g_connected) {
+    if (g_connecting) {
+        ImGui::TextColored(ImVec4(1, 1, 0, 1), "[*] Connecting to %s:%d ...", g_hostBuf, g_port);
+        if (ImGui::Button("Cancel")) g_connecting = false;
+    } else if (!g_connected) {
         ImGui::Text("Relay Host:");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(250);
