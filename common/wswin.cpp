@@ -2,6 +2,7 @@
 #include "protocol.h"
 
 #define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 
@@ -29,20 +30,19 @@ struct WsSession {
     // Fill buffer with data from a WebSocket frame
     bool fillBuffer() {
         uint8_t buffer[65536];
-        DWORD bufLen = sizeof(buffer);
-        WINHTTP_WEB_SOCKET_STATUS status = {};
+        DWORD dwBytesRead = 0;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE bufferType = {};
 
-        DWORD result = WinHttpWebSocketReceive(hSocket, buffer, bufLen, &status);
+        DWORD result = WinHttpWebSocketReceive(hSocket, buffer, sizeof(buffer), &dwBytesRead, &bufferType);
         if (result != ERROR_SUCCESS)
             return false;
 
         // Check frame type
-        if (status.eBufferType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE ||
-            status.eBufferType == WINHTTP_WEB_SOCKET_UTF8_CLOSE_BUFFER_TYPE)
+        if (bufferType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE)
             return false;  // Connection closing
 
         // Binary data — store in buffer
-        recvBuf.assign(buffer, buffer + bufLen);
+        recvBuf.assign(buffer, buffer + dwBytesRead);
         readPos = 0;
         return true;
     }
@@ -56,63 +56,105 @@ void shutdown() {}
 
 // ── connect ───────────────────────────────────────────────────────
 SocketT connect(const std::string& host, int port, const std::string& path) {
-    WsSession* s = new WsSession();
 
-    // Convert to wide strings
+    // Convert to wide strings (once, outside retry loop)
     int wlen = MultiByteToWideChar(CP_UTF8, 0, host.c_str(), -1, nullptr, 0);
     std::wstring whost(wlen, 0);
     MultiByteToWideChar(CP_UTF8, 0, host.c_str(), -1, &whost[0], wlen);
-    whost.resize(wlen - 1);  // remove null terminator
+    whost.resize(wlen - 1);
 
     wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
     std::wstring wpath(wlen, 0);
     MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wlen);
     wpath.resize(wlen - 1);
 
-    // 1. Create WinHTTP session
-    s->hSession = WinHttpOpen(L"RemoteControl/5.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!s->hSession) { delete s; return INVALID; }
+    // Retry loop — OnRender free plan may be sleeping and need time to wake
+    for (int attempt = 0; attempt < 3; attempt++) {
+        WsSession* s = new WsSession();
 
-    // 2. Connect to server
-    s->hConnect = WinHttpConnect(s->hSession, whost.c_str(),
-        (port == 443) ? INTERNET_DEFAULT_HTTPS_PORT : port, 0);
-    if (!s->hConnect) { delete s; return INVALID; }
+        // 1. Create WinHTTP session
+        s->hSession = WinHttpOpen(L"RemoteControl/5.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!s->hSession) { delete s; continue; }
 
-    // 3. Create request with WebSocket upgrade flag
-    DWORD flags = (port == 443) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(s->hConnect, L"GET", wpath.c_str(),
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hRequest) { delete s; return INVALID; }
+        // Set long timeouts — OnRender free plan takes 30-60s to wake from sleep
+        WinHttpSetTimeouts(s->hSession,
+            90000,   // resolve timeout: 90s
+            90000,   // connect timeout: 90s
+            90000,   // send timeout: 90s
+            90000);  // receive timeout: 90s
 
-    // 4. Enable WebSocket upgrade
-    BOOL upgrade = TRUE;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET,
-        &upgrade, sizeof(upgrade));
+        // 2. Connect to server
+        s->hConnect = WinHttpConnect(s->hSession, whost.c_str(),
+            (port == 443) ? INTERNET_DEFAULT_HTTPS_PORT : port, 0);
+        if (!s->hConnect) { delete s; continue; }
 
-    // 5. Send request
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-        WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        // 3. Create request with WebSocket upgrade flag
+        DWORD flags = (port == 443) ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hRequest = WinHttpOpenRequest(s->hConnect, L"GET", wpath.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!hRequest) { delete s; continue; }
+
+        // 4. Enable WebSocket upgrade
+        BOOL upgrade = TRUE;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET,
+            &upgrade, sizeof(upgrade));
+
+        // 5. Send request
+        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+            DWORD err = GetLastError();
+            char dbg[128]; snprintf(dbg, sizeof(dbg),
+                "WS send fail: attempt=%d err=%lu", attempt, err);
+            OutputDebugStringA(dbg);
+            WinHttpCloseHandle(hRequest);
+            delete s;
+            if (attempt < 2) { Sleep(3000); }
+            continue;
+        }
+
+        // 6. Receive response (should be 101 Switching Protocols)
+        if (!WinHttpReceiveResponse(hRequest, nullptr)) {
+            DWORD err = GetLastError();
+            char dbg[128]; snprintf(dbg, sizeof(dbg),
+                "WS recv fail: attempt=%d err=%lu", attempt, err);
+            OutputDebugStringA(dbg);
+            WinHttpCloseHandle(hRequest);
+            delete s;
+            if (attempt < 2) { Sleep(3000); }
+            continue;
+        }
+
+        // Check HTTP status code
+        DWORD statusCode = 0;
+        DWORD statusCodeSize = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
+        if (statusCode != 101) {
+            char dbg[128]; snprintf(dbg, sizeof(dbg),
+                "WS status=%lu (need 101)", statusCode);
+            OutputDebugStringA(dbg);
+        }
+
+        // 7. Complete WebSocket upgrade
+        s->hSocket = WinHttpWebSocketCompleteUpgrade(hRequest, 0);
         WinHttpCloseHandle(hRequest);
-        delete s; return INVALID;
+
+        if (!s->hSocket) {
+            DWORD err = GetLastError();
+            char dbg[128]; snprintf(dbg, sizeof(dbg),
+                "WS upgrade fail: err=%lu", err);
+            OutputDebugStringA(dbg);
+            delete s;
+            if (attempt < 2) { Sleep(3000); }
+            continue;
+        }
+
+        return s;  // Success!
     }
 
-    // 6. Receive response (should be 101 Switching Protocols)
-    if (!WinHttpReceiveResponse(hRequest, nullptr)) {
-        WinHttpCloseHandle(hRequest);
-        delete s; return INVALID;
-    }
-
-    // 7. Complete WebSocket upgrade
-    s->hSocket = WinHttpWebSocketCompleteUpgrade(hRequest, 0);
-    WinHttpCloseHandle(hRequest);
-
-    if (!s->hSocket) {
-        delete s; return INVALID;
-    }
-
-    return s;
+    return INVALID;  // All retries failed
 }
 
 // ── sendAll ───────────────────────────────────────────────────────

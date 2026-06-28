@@ -167,8 +167,10 @@ async def handle_websocket(ws):
         print("[-] Server disconnected")
 
 async def websocket_handler(request):
+    print(f"[WS] Connection from {request.remote}")
     ws = web.WebSocketResponse(max_msg_size=0)  # no size limit
     await ws.prepare(request)
+    print("[WS] WebSocket upgraded successfully")
     await handle_websocket(ws)
     return ws
 

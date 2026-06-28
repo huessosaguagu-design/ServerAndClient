@@ -1,6 +1,7 @@
 services:
   - type: web
     name: relay-server
-    runtime: docker
+    runtime: python
     plan: free
-    dockerfilePath: ./Dockerfile.python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python relay/relay.py
