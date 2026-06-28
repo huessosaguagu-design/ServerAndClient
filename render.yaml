@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: relay-server
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    # If the C++ Dockerfile has issues, switch to:
+    # dockerfilePath: ./Dockerfile.python

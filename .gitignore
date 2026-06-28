@@ -1,0 +1,36 @@
+# Build outputs
+build/
+out/
+x64/
+x86/
+Debug/
+Release/
+bin/
+obj/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakePresets.json
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exe
+*.dll
+
+# GCC
+*.o
+*.a
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Qwen
+.qwen/
