@@ -135,7 +135,7 @@ async def handle_poll(request):
         return web.Response(text='Bad session', status=403)
 
     try:
-        msg = await asyncio.wait_for(s.messages.get(), timeout=25.0)
+        msg = await asyncio.wait_for(s.messages.get(), timeout=10.0)
         return web.Response(body=msg, content_type='application/octet-stream')
     except asyncio.TimeoutError:
         return web.Response(status=204)

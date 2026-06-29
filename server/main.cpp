@@ -81,6 +81,15 @@ static char g_runPath[512] = "";
 static bool g_drawing = false;
 static float g_drawR = 1.0f, g_drawG = 0.3f, g_drawB = 0.3f;
 static int g_drawSize = 5;
+// Local stroke state — used to bridge between ImGui frames so that even
+// at low frame rates the ink on the remote screen stays continuous and
+// exactly lines up with where the cursor is on the displayed image.
+static bool  g_drawStrokeDown = false;    // mouse held while in draw mode
+static int   g_drawLastX = -1;
+static int   g_drawLastY = -1;
+static std::vector<std::pair<int,int>> g_drawLocalPath;  // local preview
+static ImU32 g_drawLocalColor = 0;
+static int   g_drawLocalSize = 0;
 
 // Message
 static char g_msgText[512] = "";
@@ -314,7 +323,7 @@ static void sendCommand(uint8_t ct, const std::vector<uint8_t>& pl) {
     proto::Writer w; w.u32(g_selectedClient);
     w.raw(pl.data(), pl.size());
     auto m = proto::buildMessage(proto::MSG_COMMAND, ct, w.bytes());
-    ws::sendAll(g_sock, m.data(), m.size());
+    ws::sendAllAsync(g_sock, m.data(), m.size());
 }
 static bool canSend() {
     if (!g_connected) { addLog("[!] Not connected"); return false; }
@@ -342,7 +351,7 @@ static bool decodeJpeg(const uint8_t* j, size_t n, std::vector<uint8_t>& rgba, i
     return true;
 }
 static void onMessage(uint8_t mt, uint8_t ct, std::vector<uint8_t> pl) {
-    if (mt == 0) { g_connected = false; addLog("[!] Disconnected"); return; }
+    if (mt == proto::MSG_DISCONNECT) { g_connected = false; addLog("[!] Disconnected"); return; }
     if (mt == proto::MSG_CLIENT_LIST) {
         std::lock_guard<std::mutex> lk(g_clientMutex);
         g_clients.clear();
@@ -435,10 +444,12 @@ static void doConnect() {
         g_connected = true;
         g_connecting = false;
         g_receiver.start(g_sock, onMessage);
+        ws::startAsyncSend(g_sock);
         addLog("[+] Connected: %s:%d", g_hostBuf, g_port);
     }).detach();
 }
 static void doDisconnect() {
+    ws::stopAsyncSend();
     g_receiver.stop(); ws::close(g_sock); g_sock = ws::INVALID; g_connected = false;
     std::lock_guard<std::mutex> lk(g_clientMutex);
     g_clients.clear(); g_selectedClient = 0;
@@ -545,12 +556,17 @@ static void sendDraw(uint8_t dtype, int x, int y, uint8_t r, uint8_t g, uint8_t 
     sendCommand(proto::CMD_DRAW, w.bytes());
 }
 
+// Resets local + remote stroke state. We deliberately keep g_drawing = true;
+// the user expects the pen to remain armed between strokes.
 static void sendClearDraw() {
     if (!canSend()) return;
     proto::Writer w;
     w.u8(1); // clear
     w.u32(0); w.u32(0); w.u8(0); w.u8(0); w.u8(0); w.u32(0);
     sendCommand(proto::CMD_DRAW, w.bytes());
+    g_drawStrokeDown = false;
+    g_drawLastX = g_drawLastY = -1;
+    g_drawLocalPath.clear();
     addLog("[>] Draw: cleared");
 }
 
@@ -612,7 +628,7 @@ static void sendKickClient(uint32_t clientId) {
     proto::Writer w;
     w.u32(clientId);
     auto m = proto::buildMessage(proto::MSG_KICK_CLIENT, 0, w.bytes());
-    ws::sendAll(g_sock, m.data(), m.size());
+    ws::sendAllAsync(g_sock, m.data(), m.size());
     addLog("[!] Kick client: #%u", clientId);
 }
 
@@ -952,7 +968,7 @@ static void drawScreen(float w) {
     if (g_autoRefresh) {
         ImGui::SameLine(0, 12);
         ImGui::PushItemWidth(100);
-        ImGui::SliderFloat("##iv", &g_refreshInterval, 0.5f, 10.0f, "%.1fs");
+        ImGui::SliderFloat("##iv", &g_refreshInterval, 0.2f, 10.0f, "%.1fs");
         ImGui::PopItemWidth();
     }
     ImGui::SameLine(0, 16);
@@ -1017,12 +1033,59 @@ static void drawScreen(float w) {
             int cy = (int)((mp.y - imgMin.y) / sc);
 
             if (g_drawing) {
-                // Drawing mode — send draw commands
-                if (ImGui::IsMouseDown(0)) {
-                    uint8_t r = (uint8_t)(g_drawR * 255);
-                    uint8_t g = (uint8_t)(g_drawG * 255);
-                    uint8_t b = (uint8_t)(g_drawB * 255);
-                    sendDraw(0, cx, cy, r, g, b, g_drawSize);
+                uint8_t rcol = (uint8_t)(g_drawR * 255);
+                uint8_t gcol = (uint8_t)(g_drawG * 255);
+                uint8_t bcol = (uint8_t)(g_drawB * 255);
+
+                // Stroke started this frame
+                if (ImGui::IsMouseClicked(0)) {
+                    g_drawStrokeDown = true;
+                    g_drawLastX = cx; g_drawLastY = cy;
+                    g_drawLocalPath.clear();
+                    g_drawLocalPath.emplace_back(cx, cy);
+                    g_drawLocalColor = IM_COL32(rcol, gcol, bcol, 255);
+                    g_drawLocalSize = g_drawSize;
+                    // Wire-side: marker-down — client adds a fresh stroke anchor.
+                    sendDraw(0, cx, cy, rcol, gcol, bcol, g_drawSize);
+                } else if (ImGui::IsMouseDown(0) && g_drawStrokeDown) {
+                    // Drag — issue a line segment from previous anchor to current
+                    // position. Even if cx==lastX && cy==lastY and we skipped
+                    // a frame, the overlay's persistent stroke storage guarantees
+                    // a continuous ink with no gap between frames.
+                    int dx = cx - g_drawLastX, dy = cy - g_drawLastY;
+                    bool moved = (dx*dx + dy*dy) >= 1;
+                    if (moved) {
+                        // Wire-side: LineTo from previous anchor to current.
+                        // The x/y we send are image-pixel coords so the client
+                        // draws exactly where the user sees the cursor.
+                        sendDraw(2, cx, cy, rcol, gcol, bcol, g_drawSize);
+                        g_drawLastX = cx; g_drawLastY = cy;
+                        g_drawLocalPath.emplace_back(cx, cy);
+                    }
+                }
+                if (ImGui::IsMouseReleased(0)) {
+                    // Mouse up: end of stroke. We DO NOT touch g_drawing —
+                    // pen stays armed so the user can immediately start another
+                    // stroke without re-checking the box. The on-screen ink
+                    // stays where it was drawn, only cleared by Clear button.
+                    g_drawStrokeDown = false;
+                    g_drawLastX = g_drawLastY = -1;
+                }
+
+                // Local preview — render the path that hasn't yet been ack'd
+                // to the client. This guarantees what the user sees on their
+                // screen lines up byte-for-byte with what the client will draw,
+                // closing the visual gap entirely.
+                if (!g_drawLocalPath.empty()) {
+                    auto* dl = ImGui::GetWindowDrawList();
+                    ImVec2 a(imgMin.x + g_drawLocalPath.front().first * sc,
+                             imgMin.y + g_drawLocalPath.front().second * sc);
+                    for (size_t i = 1; i < g_drawLocalPath.size(); i++) {
+                        ImVec2 b(imgMin.x + g_drawLocalPath[i].first * sc,
+                                 imgMin.y + g_drawLocalPath[i].second * sc);
+                        dl->AddLine(a, b, g_drawLocalColor, (float)g_drawLocalSize);
+                        a = b;
+                    }
                 }
             } else {
                 // Click mode
@@ -1041,7 +1104,7 @@ static void drawScreen(float w) {
             }
         }
         ImGui::TextColored(DS::T3, "  %s",
-            g_drawing ? "Draw mode: hold left mouse to draw on screen" :
+            g_drawing ? "Draw mode: hold left mouse to draw on screen | remote ink persists until Clear" :
                         "Click = left | Right-click = right | Double = double-click");
     } else {
         emptyState("Click 'Capture' above", "then click on the image to interact", w);
