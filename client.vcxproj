@@ -33,7 +33,7 @@
     <ClCompile>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <WarningLevel>Level3</WarningLevel>
-      <AdditionalIncludeDirectories>common;imgui-1.92.8;imgui-1.92.8\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_WIN32_WINNT=0x0A00;_CRT_SECURE_NO_WARNINGS;_WINSOCK_DEPRECATED_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
       <BufferSecurityCheck>true</BufferSecurityCheck>
@@ -42,9 +42,8 @@
       <WholeProgramOptimization>true</WholeProgramOptimization>
     </ClCompile>
     <Link>
-      <SubSystem>Windows</SubSystem>
-      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;gdiplus.lib;ws2_32.lib;advapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Console</SubSystem>
+      <AdditionalDependencies>gdiplus.lib;ws2_32.lib;advapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>libcmt.lib;msvcrt.lib</IgnoreSpecificDefaultLibraries>
     </Link>
   </ItemDefinitionGroup>
@@ -65,21 +64,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="client\main.cpp" />
-    <ClCompile Include="common\imgui_setup.cpp" />
     <ClCompile Include="common\wswin.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="imgui.vcxproj">
-      <Project>{1A2B3C4D-5E6F-4A5B-8C9D-0A1B2C3D4E5F}</Project>
-    </ProjectReference>
     <ProjectReference Include="common.vcxproj">
       <Project>{2B3C4D5E-6F7A-4B6C-9D0E-1A2B3C4D5E6F}</Project>
     </ProjectReference>
   </ItemGroup>
-  <ItemDefinitionGroup>
-    <PostBuildEvent>
-      <Command>if not exist "$(OutDir)" mkdir "$(OutDir)" &amp;&amp; copy /y "$(SolutionDir)click.wav" "$(OutDir)click.wav"</Command>
-    </PostBuildEvent>
-  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

@@ -105,6 +105,20 @@ async def handle_send(request):
                     fwd = build_msg(MSG_COMMAND, cmd_type, payload[4:])
                     await cs.messages.put(fwd)
                     break
+        elif msg_type == 7:  # MSG_KICK_CLIENT
+            if len(payload) >= 4:
+                target_id = struct.unpack('<I', payload[:4])[0]
+                for sid_str, cs in list(client_sessions.items()):
+                    if cs.id == target_id:
+                        print(f"[!] Kicking client id={target_id}", flush=True)
+                        # Mark dead so its read loop stops after the next poll cycle
+                        cs.alive = False
+                        if sid_str in client_sessions:
+                            del client_sessions[sid_str]
+                        if sid_str in sessions:
+                            del sessions[sid_str]
+                        await broadcast_client_list()
+                        break
     elif s.role == ROLE_CLIENT:
         if msg_type == MSG_RESPONSE:
             fwd = build_msg(MSG_RESPONSE, cmd_type, struct.pack('<I', s.id) + payload)

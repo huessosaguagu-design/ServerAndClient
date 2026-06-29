@@ -23,8 +23,8 @@ SocketT connect(const std::string& host, int port, const std::string& regPayload
 
 bool sendAll(SocketT sock, const void* data, size_t len);
 bool sendMessage(SocketT sock, const std::vector<uint8_t>& msg);
-bool recvAll(SocketT, void*, size_t) { return false; }
-bool recvMessage(SocketT, uint8_t&, uint8_t&, std::vector<uint8_t>&) { return false; }
+inline bool recvAll(SocketT, void*, size_t) { return false; }
+inline bool recvMessage(SocketT, uint8_t&, uint8_t&, std::vector<uint8_t>&) { return false; }
 
 void close(SocketT sock);
 
