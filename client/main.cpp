@@ -75,6 +75,8 @@ static bool getEncoderClsid(const wchar_t* mimeType, CLSID* outClsid) {
     UINT num = 0, size = 0;
     Gdiplus::GetImageEncodersSize(&num, &size);
     if (size == 0) return false;
+    // num * sizeof(ImageCodecInfo) == size (guaranteed by GDI+ contract)
+    __assume(num <= size / sizeof(Gdiplus::ImageCodecInfo));
     auto* enc = (Gdiplus::ImageCodecInfo*)malloc(size);
     if (!enc) return false;
     Gdiplus::GetImageEncoders(num, size, enc);
